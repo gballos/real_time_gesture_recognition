@@ -101,9 +101,8 @@ def window_to_spectrogram(window: np.ndarray,
         mag = np.abs(Zxx)       # (15, 4)
         mag = mag[1:, :4]       # drop DC bin → (14, 4)
 
-        # Log-compress + z-score normalise
+        # Log-compress bc EMG spectrograms are very sparse and skewed.
         mag = np.log1p(mag)
-        mag = (mag - mag.mean()) / (mag.std() + 1e-8)
 
         specs.append(mag)       # (14, 4)
 
