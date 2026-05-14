@@ -1,0 +1,7 @@
+# Ignore unzipped dataset
+/data/ninaprodb5/s*/
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
