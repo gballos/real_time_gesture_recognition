@@ -38,6 +38,7 @@ import sys
 from pathlib import Path
 
 import torch
+import numpy as np
 from tqdm import tqdm
 
 # ── Project imports ─────────────────────────────────────────
@@ -64,6 +65,9 @@ STAGES = ["preprocess", "features", "train", "eval", "realtime"]
 # ════════════════════════════════════════════════════════════
 # Config defaults — edit here or override via CLI flags
 # ════════════════════════════════════════════════════════════
+
+torch.manual_seed(42)
+np.random.seed(42)
 
 DEFAULT_CFG = dict(
     # Paths
