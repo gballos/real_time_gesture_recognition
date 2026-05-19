@@ -34,6 +34,7 @@ Usage examples
 import argparse
 import logging
 import os
+import pickle
 import sys
 from pathlib import Path
 
@@ -74,6 +75,7 @@ DEFAULT_CFG = dict(
     data_dir    = "data/ninaprodb5",
     models_dir  = "models",
     plots_dir   = "plots",
+    cache_dir   = "cache",          # stage output persistence
 
     # Data
     unzip       = True,
@@ -128,17 +130,49 @@ def _stage_index(name: str) -> int:
 
 
 # ════════════════════════════════════════════════════════════
+# Stage cache — persist / restore each stage's output
+# ════════════════════════════════════════════════════════════
+
+def _cache_path(cache_dir: str, stage: str) -> Path:
+    return Path(cache_dir) / f"{stage}.pkl"
+
+
+def _save_cache(cache_dir: str, stage: str, obj) -> None:
+    """Pickle stage output to cache_dir/<stage>.pkl."""
+    path = _cache_path(cache_dir, stage)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    log.info("Cache saved  → %s", path)
+
+
+def _load_cache(cache_dir: str, stage: str):
+    """Load pickled stage output, or return None if it doesn't exist."""
+    path = _cache_path(cache_dir, stage)
+    if not path.exists():
+        return None
+    with open(path, "rb") as f:
+        obj = pickle.load(f)
+    log.info("Cache loaded ← %s", path)
+    return obj
+
+
+# ════════════════════════════════════════════════════════════
 # Stage functions
 # ════════════════════════════════════════════════════════════
 
 def stage_preprocess(cfg: dict) -> dict:
     log.info("── Stage 1: PREPROCESS ──────────────────────────────")
-    return load_all_subjects(cfg)
+    splits = load_all_subjects(cfg)
+    _save_cache(cfg["cache_dir"], "preprocess", splits)
+    return splits
 
 
 def stage_features(splits: dict, cfg: dict) -> dict:
     log.info("── Stage 2: FEATURE EXTRACTION ──────────────────────")
-    return extract_all(splits, cfg)
+    stft_data = extract_all(splits, cfg)
+    _save_cache(cfg["cache_dir"], "features", stft_data)
+    return stft_data
 
 
 def stage_train(stft_data: dict, cfg: dict,
@@ -177,6 +211,7 @@ def stage_train(stft_data: dict, cfg: dict,
 
             trained_models[arch][sid] = model
 
+    _save_cache(cfg["cache_dir"], "train", trained_models)
     return trained_models
 
 
@@ -195,6 +230,7 @@ def stage_eval(trained_models: dict, stft_data: dict,
     plot_confusion(results, sid=sids[0],
                    save_path=os.path.join(plots_dir, f"confusion_{sids[0]}.png"))
 
+    _save_cache(cfg["cache_dir"], "eval", results)
     return results
 
 
@@ -236,6 +272,8 @@ def parse_args():
     p.add_argument("--data-dir",   default=DEFAULT_CFG["data_dir"])
     p.add_argument("--models-dir", default=DEFAULT_CFG["models_dir"])
     p.add_argument("--plots-dir",  default=DEFAULT_CFG["plots_dir"])
+    p.add_argument("--cache-dir",  default=DEFAULT_CFG["cache_dir"],
+                   help="Directory for stage cache files (default: cache/)")
     p.add_argument("--epochs",     type=int,   default=DEFAULT_CFG["epochs"])
     p.add_argument("--batch-size", type=int,   default=DEFAULT_CFG["batch_size"])
     p.add_argument("--lr",         type=float, default=DEFAULT_CFG["lr"])
@@ -265,6 +303,7 @@ def main():
         data_dir      = args.data_dir,
         models_dir    = args.models_dir,
         plots_dir     = args.plots_dir,
+        cache_dir     = args.cache_dir,
         epochs        = args.epochs,
         batch_size    = args.batch_size,
         lr            = args.lr,
@@ -275,6 +314,7 @@ def main():
 
     os.makedirs(cfg["models_dir"], exist_ok=True)
     os.makedirs(cfg["plots_dir"],  exist_ok=True)
+    os.makedirs(cfg["cache_dir"],  exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Device: %s", device)
@@ -293,6 +333,8 @@ def main():
         return from_idx <= idx <= until_idx
 
     # ── State shared across stages ───────────────────────────
+    # Each variable is populated either by running the stage or by loading
+    # the cache written when that stage last ran.
     splits         = None
     stft_data      = None
     trained_models = None
@@ -300,29 +342,40 @@ def main():
 
     if should_run("preprocess"):
         splits = stage_preprocess(cfg)
+    else:
+        splits = _load_cache(cfg["cache_dir"], "preprocess")
 
     if should_run("features"):
         if splits is None:
-            log.error("Stage 'features' requires 'preprocess' output. "
-                      "Run from 'preprocess' or provide splits manually.")
+            log.error("Stage 'features' needs 'preprocess' output. "
+                      "Run from 'preprocess' first, or ensure cache/preprocess.pkl exists.")
             sys.exit(1)
         stft_data = stage_features(splits, cfg)
+    else:
+        stft_data = _load_cache(cfg["cache_dir"], "features")
 
     if should_run("train"):
         if stft_data is None:
-            log.error("Stage 'train' requires 'features' output.")
+            log.error("Stage 'train' needs 'features' output. "
+                      "Run from 'features' first, or ensure cache/features.pkl exists.")
             sys.exit(1)
         trained_models = stage_train(stft_data, cfg, device)
+    else:
+        trained_models = _load_cache(cfg["cache_dir"], "train")
 
     if should_run("eval"):
         if trained_models is None or stft_data is None:
-            log.error("Stage 'eval' requires 'train' and 'features' output.")
+            log.error("Stage 'eval' needs 'train' and 'features' output. "
+                      "Ensure cache/train.pkl and cache/features.pkl exist.")
             sys.exit(1)
         results = stage_eval(trained_models, stft_data, cfg, device)
+    else:
+        results = _load_cache(cfg["cache_dir"], "eval")
 
     if should_run("realtime"):
         if trained_models is None:
-            log.error("Stage 'realtime' requires 'train' output.")
+            log.error("Stage 'realtime' needs 'train' output. "
+                      "Ensure cache/train.pkl exists.")
             sys.exit(1)
         stage_realtime(trained_models, cfg, device)
 
