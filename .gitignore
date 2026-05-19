@@ -1,7 +1,29 @@
-# Ignore unzipped dataset
-/data/ninaprodb5/s*/
-
-# Ignore Python cache files
+# ── Dataset (raw + unzipped) ─────────────────────────────────
+data/ninaprodb5/s*/
+ 
+# ── Stage cache (large pickled numpy arrays) ─────────────────
+cache/*.pkl
+ 
+# ── Plots (reproducible from eval stage) ─────────────────────
+plots/*.png
+plots/*.pdf
+ 
+# ── Python ───────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+ 
+# ── Jupyter ───────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+ 
+# ── Environment ───────────────────────────────────────────────
+.env
+.venv/
+env/
+ 
