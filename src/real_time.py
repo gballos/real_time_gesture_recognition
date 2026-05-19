@@ -60,17 +60,49 @@ def model_footprint(model: nn.Module) -> dict:
 # ─────────────────────────────────────────────
 
 def count_flops(model: nn.Module, device: torch.device):
-    """Returns GFLOPs for one forward pass, or None if thop not installed."""
+    """
+    Returns GFLOPs for one forward pass measured on CPU.
+
+    Always uses CPU regardless of `device` so the FLOP count is on the same
+    hardware as benchmark_latency — keeping required_gflops_per_sec meaningful.
+    Returns None if thop is not installed.
+    """
     try:
         from thop import profile
-        dummy = torch.randn(*DUMMY_INPUT).to(device)
+        cpu_model = model.cpu()
+        dummy = torch.randn(*DUMMY_INPUT)   # CPU tensor
         with torch.no_grad():
-            flops, _ = profile(model, inputs=(dummy,), verbose=False)
-        return flops / 1e9   # GFLOPs
+            flops, _ = profile(cpu_model, inputs=(dummy,), verbose=False)
+        model.to(device)   # restore original device
+        return flops / 1e9
     except ImportError:
         log.warning("thop not installed — skipping FLOP count. "
                     "Install with: pip install thop")
         return None
+
+
+def required_gflops_per_sec(flops_g: float | None,
+                             budget_ms: float = RT_BUDGET_MS) -> float | None:
+    """
+    Minimum sustained GFLOP/s a processor must deliver to meet the RT budget.
+
+      required = GFLOPs_per_inference / budget_in_seconds
+
+    This is a theoretical lower bound assuming 100% utilisation with no
+    overhead — real hardware needs headroom above this figure.
+
+    Parameters
+    ----------
+    flops_g   : GFLOPs per inference (from count_flops)
+    budget_ms : inference time budget in ms (default RT_BUDGET_MS = 40 ms)
+
+    Returns
+    -------
+    float  GFLOP/s required, or None if flops_g is None
+    """
+    if flops_g is None:
+        return None
+    return flops_g / (budget_ms / 1000.0)
 
 
 # ─────────────────────────────────────────────
@@ -127,10 +159,12 @@ def benchmark_all(trained_models: dict, device: torch.device) -> dict:
     for arch, models_by_sid in tqdm(trained_models.items(),
                                     desc="RT benchmark", unit="arch"):
         model = next(iter(models_by_sid.values()))
+        flops_g = count_flops(model, device)
         rt[arch] = dict(
-            footprint = model_footprint(model),
-            flops     = count_flops(model, device),
-            latency   = benchmark_latency(model),
+            footprint      = model_footprint(model),
+            flops          = flops_g,
+            required_gflops= required_gflops_per_sec(flops_g),
+            latency        = benchmark_latency(model),
         )
         log.info("[%s] params=%s  size=%.1f MB  p95=%.1f ms  rt_ok=%s",
                  arch,
@@ -159,14 +193,17 @@ def print_rt_report(rt: dict) -> None:
         fp    = data["footprint"]
         lat   = data["latency"]
         flops = data["flops"]
+        req   = data["required_gflops"]
 
         print(f"\n  {lbl}")
         print(f"    Parameters : {fp['total_params']:>12,}  "
               f"(trainable: {fp['trainable_params']:,})")
         print(f"    Model size : {fp['size_mb']:>9.1f} MB")
         if flops is not None:
-            print(f"    GFLOPs     : {flops:>9.3f}")
-        print(f"    Latency    :  {lat['mean_ms']:.2f} +/- {lat['std_ms']:.2f} ms  "
+            print(f"    GFLOPs     : {flops:>9.4f}  (per inference)")
+            print(f"    Min GFLOP/s: {req:>9.4f}  (to meet {RT_BUDGET_MS:.0f} ms budget, "
+                  f"theoretical lower bound)")
+        print(f"    Latency    :  {lat['mean_ms']:.2f} ± {lat['std_ms']:.2f} ms  "
               f"(p95={lat['p95_ms']:.2f} ms)")
         status = "PASS" if lat["rt_ok"] else "FAIL"
         sign   = "<=" if lat["rt_ok"] else ">"
@@ -176,18 +213,20 @@ def print_rt_report(rt: dict) -> None:
 
 
 def plot_rt_comparison(rt: dict, save_path: str = None) -> None:
-    """Two-panel: latency bars + trainable parameter count."""
+    """Three-panel: latency bars, trainable parameter count, min GFLOP/s required."""
     archs  = list(rt.keys())
     colors = ["steelblue", "coral", "seagreen"]
+    x      = np.arange(len(archs))
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    has_flops = any(rt[a]["required_gflops"] is not None for a in archs)
+    ncols = 3 if has_flops else 2
+    fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 5))
     fig.suptitle("Real-Time Feasibility", fontsize=13, fontweight="bold")
 
     # Panel 1 — latency
     ax    = axes[0]
     means = [rt[a]["latency"]["mean_ms"] for a in archs]
     p95s  = [rt[a]["latency"]["p95_ms"]  for a in archs]
-    x     = np.arange(len(archs))
     ax.bar(x, means, color=[colors[i % len(colors)] for i in range(len(archs))],
            alpha=0.8, label="Mean")
     ax.scatter(x, p95s, marker="D", color="black", zorder=5, label="p95")
@@ -208,6 +247,24 @@ def plot_rt_comparison(rt: dict, save_path: str = None) -> None:
     ax.set_xticklabels([LABELS.get(a, a) for a in archs])
     ax.set_ylabel("Trainable parameters (M)")
     ax.set_title("Model Complexity")
+
+    # Panel 3 — minimum GFLOP/s required to meet RT budget
+    if has_flops:
+        ax = axes[2]
+        req_vals = [rt[a]["required_gflops"] or 0.0 for a in archs]
+        bars = ax.bar(x, req_vals,
+                      color=[colors[i % len(colors)] for i in range(len(archs))],
+                      alpha=0.8)
+        # Annotate each bar with the actual value
+        for bar, val in zip(bars, req_vals):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + max(req_vals) * 0.02,
+                    f"{val:.3f}", ha="center", va="bottom", fontsize=9)
+        ax.set_xticks(x)
+        ax.set_xticklabels([LABELS.get(a, a) for a in archs])
+        ax.set_ylabel("GFLOP/s")
+        ax.set_title(f"Min GFLOP/s to Meet {RT_BUDGET_MS:.0f} ms Budget\n"
+                     "(theoretical lower bound)")
 
     plt.tight_layout()
     if save_path:
