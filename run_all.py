@@ -301,7 +301,7 @@ def parse_args():
                         "(assumes previous stages already ran).")
     ALL_ARCHS = ["slow_fusion", "slow_fusion_se", 
                  "slow_fusion_se_arc", "mobilenet"]
-    p.add_argument("--arch", nargs="+", default=None,
+    p.add_argument("--arch", nargs="+", default=ALL_ARCHS,
                    choices=ALL_ARCHS)  
     p.add_argument("--list-stages", action="store_true",
                    help="Print available stages and exit.")
