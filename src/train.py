@@ -36,6 +36,25 @@ DEFAULTS = dict(
     dropout           = 0.5,
 )
 
+# MobileNet needs more epochs and a more patient scheduler because
+# three differential LR groups converge more slowly than a single LR.
+MOBILENET_OVERRIDES = dict(
+    epochs            = 60,
+    lr_patience       = 5,
+    max_lr_reductions = 3,
+)
+
+
+def _resolve_cfg(cfg: dict, arch_label: str) -> dict:
+    """
+    Return a cfg dict with architecture-specific overrides applied.
+    Keys already set explicitly in cfg take precedence over overrides.
+    """
+    if arch_label == "mobilenet":
+        merged = {**MOBILENET_OVERRIDES, **cfg}
+        return merged
+    return cfg
+
 
 def _make_loaders(data: dict, cfg: dict, device: torch.device):
     bs  = cfg.get("batch_size", DEFAULTS["batch_size"])
@@ -71,6 +90,7 @@ def train_one_subject(
     model   : trained nn.Module
     history : list of dicts  {epoch, train_loss, val_loss, val_acc, lr}
     """
+    cfg = _resolve_cfg(cfg, arch_label)
     epochs        = cfg.get("epochs",            DEFAULTS["epochs"])
     lr            = cfg.get("lr",                DEFAULTS["lr"])
     lr_factor     = cfg.get("lr_factor",         DEFAULTS["lr_factor"])
@@ -79,9 +99,14 @@ def train_one_subject(
 
     train_loader, val_loader, train_size, val_size = _make_loaders(data, cfg, device)
 
-    optimizer  = optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=lr
-    )
+    # Use differential LR param groups when the model supports it (MobileNet),
+    # otherwise fall back to a flat single-LR over all trainable params.
+    if hasattr(model, "get_param_groups"):
+        param_groups = model.get_param_groups(lr)
+    else:
+        param_groups = filter(lambda p: p.requires_grad, model.parameters())
+
+    optimizer  = optim.Adam(param_groups, lr=lr)
     scheduler  = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=lr_factor, patience=lr_patience
     )
@@ -148,4 +173,4 @@ def train_one_subject(
                     "cfg":         cfg}, checkpoint_path)
         log.info("Checkpoint saved → %s", checkpoint_path)
 
-    return model, history
+    return model, historyx  
