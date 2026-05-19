@@ -95,8 +95,18 @@ def evaluate_all(trained_models: dict,
 # Visualisation
 # ─────────────────────────────────────────────
 
-COLORS = {"slow_fusion": "steelblue", "mobilenet": "coral"}
-LABELS = {"slow_fusion": "[A] SlowFusion", "mobilenet": "[B] MobileNetV2"}
+COLORS = {
+    "slow_fusion":        "steelblue",
+    "slow_fusion_se":     "royalblue",
+    "slow_fusion_se_arc": "darkblue",
+    "mobilenet":          "coral",
+}
+LABELS = {
+    "slow_fusion":        "[A] SlowFusion",
+    "slow_fusion_se":     "[A+] SlowFusion+SE",
+    "slow_fusion_se_arc": "[A++] SF+SE+ArcFace",
+    "mobilenet":          "[B] MobileNetV2",
+}
 
 
 def plot_comparison(results: dict, save_path: str | None = None) -> None:
