@@ -37,7 +37,14 @@ RT_BUDGET_MS = 40.0       # ms available for inference  (300 - 260)
 N_WARMUP     = 50
 N_RUNS       = 500
 DUMMY_INPUT  = (1, 4, 8, 14)   # single window
-LABELS = {"slow_fusion": "[A] SlowFusion", "mobilenet": "[B] MobileNetV2"}
+
+LABELS = {
+    "slow_fusion":        "[A] SlowFusion",
+    "slow_fusion_se":     "[A+] SlowFusion+SE",
+    "slow_fusion_se_arc": "[A++] SF+SE+ArcFace",
+    "mobilenet":          "[B] MobileNetV2",
+}
+
 
 
 # ─────────────────────────────────────────────
