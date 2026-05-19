@@ -100,7 +100,7 @@ class MobileNetV2EMG(nn.Module):
     """
 
     def __init__(self, n_classes: int = 17, dropout: float = 0.5,
-                 freeze_until: int = 15):
+                 freeze_until: int = 7):
         super().__init__()
         self._upsample = (64, 64)
 
@@ -125,14 +125,40 @@ class MobileNetV2EMG(nn.Module):
             nn.Linear(in_features, n_classes),
         )
 
-        self.features   = base.features
-        self.classifier = base.classifier
+        self.features    = base.features
+        self.classifier  = base.classifier
+        self._freeze_until = freeze_until
 
         # Freeze early layers
         for i, layer in enumerate(self.features):
             if i < freeze_until:
                 for p in layer.parameters():
                     p.requires_grad = False
+
+    def get_param_groups(self, base_lr: float) -> list[dict]:
+        """
+        Three parameter groups with differential learning rates:
+          - mid layers  features[_freeze_until..13]  : base_lr * 0.01
+          - top layer   features[14..]               : base_lr * 0.1
+          - classifier                               : base_lr
+
+        Only includes parameters with requires_grad=True.
+        """
+        mid_params, top_params = [], []
+        for i, layer in enumerate(self.features):
+            params = [p for p in layer.parameters() if p.requires_grad]
+            if not params:
+                continue
+            if i < 14:
+                mid_params.extend(params)
+            else:
+                top_params.extend(params)
+        cls_params = [p for p in self.classifier.parameters() if p.requires_grad]
+        return [
+            {"params": mid_params, "lr": base_lr * 0.01},
+            {"params": top_params, "lr": base_lr * 0.1},
+            {"params": cls_params, "lr": base_lr},
+        ]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(x, size=self._upsample,
