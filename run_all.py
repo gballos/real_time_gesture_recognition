@@ -121,6 +121,42 @@ def _load_checkpoint(path: str, arch: str, cfg: dict,
     return model, ckpt.get("history", [])
 
 
+def _reconstruct_trained_models(cfg: dict, device: torch.device) -> dict | None:
+    """
+    Rebuild trained_models dict from saved .pt checkpoint files.
+
+    Called when --from skips the train stage so eval/realtime can still run
+    without a cache/train.pkl.  Returns None if any expected checkpoint is
+    missing (caller should abort with a clear error).
+    """
+    archs      = cfg["architectures"]
+    models_dir = cfg["models_dir"]
+
+    # Discover subjects from the checkpoint directory of the first arch
+    first_arch_dir = Path(models_dir) / archs[0]
+    if not first_arch_dir.exists():
+        return None
+
+    sids = sorted(p.stem for p in first_arch_dir.glob("*.pt"))
+    if not sids:
+        return None
+
+    trained_models = {arch: {} for arch in archs}
+    for arch in archs:
+        for sid in sids:
+            ckpt_path = _ckpt_path(models_dir, arch, sid)
+            model, _ = _load_checkpoint(ckpt_path, arch, cfg, device)
+            if model is None:
+                log.error("Missing checkpoint: %s — run the train stage first.",
+                          ckpt_path)
+                return None
+            trained_models[arch][sid] = model
+
+    log.info("Reconstructed trained_models from .pt files: %d arch × %d subjects",
+             len(archs), len(sids))
+    return trained_models
+
+
 def _stage_index(name: str) -> int:
     try:
         return STAGES.index(name)
@@ -211,7 +247,6 @@ def stage_train(stft_data: dict, cfg: dict,
 
             trained_models[arch][sid] = model
 
-    _save_cache(cfg["cache_dir"], "train", trained_models)
     return trained_models
 
 
@@ -361,7 +396,11 @@ def main():
             sys.exit(1)
         trained_models = stage_train(stft_data, cfg, device)
     else:
-        trained_models = _load_cache(cfg["cache_dir"], "train")
+        trained_models = _reconstruct_trained_models(cfg, device)
+        if trained_models is None:
+            log.error("Could not reconstruct trained_models from .pt files. "
+                      "Run the train stage first: python run_all.py --until train")
+            sys.exit(1)
 
     if should_run("eval"):
         if trained_models is None or stft_data is None:
