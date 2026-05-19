@@ -173,4 +173,4 @@ def train_one_subject(
                     "cfg":         cfg}, checkpoint_path)
         log.info("Checkpoint saved → %s", checkpoint_path)
 
-    return model, historyx  
+    return model, history
