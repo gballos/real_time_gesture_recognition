@@ -300,7 +300,7 @@ def parse_args():
                    help="Start pipeline from this stage "
                         "(assumes previous stages already ran).")
     ALL_ARCHS = ["slow_fusion", "mobilenet", "tcn_aot", "tcn_att"]
-    p.add_argument("--arch",       nargs="+", default=ALL_ARCHS,
+    p.add_argument("--arch",       nargs="+", default=None,
                    choices=ALL_ARCHS,
                    help="Which architectures to run (default: all four).")
     p.add_argument("--list-stages", action="store_true",
@@ -333,20 +333,35 @@ def main():
             print(f"  {i}. {s}")
         sys.exit(0)
 
-    # Build config from defaults + CLI overrides
+    # Build config from defaults + CLI overrides.
+    # Training params (epochs, batch_size, lr) are only added to cfg
+    # when the user explicitly passed them on the CLI, so that
+    # per-architecture overrides in _resolve_cfg() can take effect.
+    # If the user types --epochs 50, that wins over everything.
+    # If they don't, the arch override (e.g. TCN_OVERRIDES) wins over DEFAULTS.
     cfg = dict(DEFAULT_CFG)
     cfg.update(dict(
         data_dir      = args.data_dir,
         models_dir    = args.models_dir,
         plots_dir     = args.plots_dir,
         cache_dir     = args.cache_dir,
-        epochs        = args.epochs,
-        batch_size    = args.batch_size,
-        lr            = args.lr,
         notch         = not args.no_notch,
         unzip         = not args.no_unzip,
         architectures = args.arch or DEFAULT_CFG["architectures"],
     ))
+
+    # Remove training params that the user did NOT explicitly set,
+    # so arch-specific overrides in train.py can take effect.
+    for key in ("epochs", "batch_size", "lr"):
+        cli_val = getattr(args, key)
+        if cli_val == DEFAULT_CFG[key]:
+            # User didn't override — remove from cfg so _resolve_cfg
+            # can apply arch-specific values.  DEFAULTS in train.py
+            # serves as the final fallback.
+            cfg.pop(key, None)
+        else:
+            # User explicitly set a non-default value — keep it.
+            cfg[key] = cli_val
 
     os.makedirs(cfg["models_dir"], exist_ok=True)
     os.makedirs(cfg["plots_dir"],  exist_ok=True)
