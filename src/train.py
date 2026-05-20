@@ -3,18 +3,14 @@ train.py
 ========
 Training loop shared by all architectures.
 
-Features:
-  - ReduceLROnPlateau + early stopping for SlowFusion variants  [1]
-  - CosineAnnealingLR for MobileNet  [7]
-  - Label smoothing (ε=0.1) for MobileNet  [6][8]
-  - ArcFace-aware forward pass (passes labels in training)
-  - Per-epoch history, checkpoint saving
+Handles two input conventions:
+  - STFT architectures (slow_fusion, mobilenet): use X_train_stft / X_test_stft
+  - Raw architectures  (tcn_aot, tcn_att):       use X_train_raw  / X_test_raw
 
 References
 ----------
-[6]  Müller, Kornblith & Hinton (2019) "When Does Label Smoothing Help?" NeurIPS.
-[7]  Loshchilov & Hutter (2017) "SGDR: SGD with Warm Restarts." ICLR.
-[8]  Szegedy et al. (2016) "Rethinking the Inception Architecture." CVPR.
+[1]  Côté-Allard et al. (2019) — SlowFusion defaults
+[9]  Tsinganos et al. (2019) — TCN defaults
 """
 
 import logging
@@ -38,11 +34,11 @@ DEFAULTS = dict(
     lr_patience       = 3,
     max_lr_reductions = 2,
     dropout           = 0.5,
-    label_smoothing   = 0.0,   # hard labels for [1]
+    label_smoothing   = 0.0,
     scheduler         = "plateau",
 )
 
-# MobileNet: cosine LR + label smoothing  [6][7][8]
+# MobileNet: more epochs + patient scheduler + label smoothing + cosine LR
 MOBILENET_OVERRIDES = dict(
     epochs            = 60,
     lr_patience       = 5,
@@ -51,34 +47,42 @@ MOBILENET_OVERRIDES = dict(
     scheduler         = "cosine",
 )
 
-# SE variant: slightly more epochs for SE params to settle
-SE_OVERRIDES = dict(
-    epochs            = 40,
+# TCN: matches [9] — lr=0.01, 30 epochs, dropout=0.05
+# Dropout is set in the architecture, not here.
+TCN_OVERRIDES = dict(
+    lr                = 0.01,
+    epochs            = 30,
+    lr_patience       = 5,
+    max_lr_reductions = 2,
 )
 
-# ArcFace variant: more epochs + patient scheduler (angular margin is harder)
-SE_ARC_OVERRIDES = dict(
-    epochs            = 50,
-    lr_patience       = 5,
-    max_lr_reductions = 3,
-)
+# Which architectures use raw EMG vs STFT
+from src.architectures import RAW_ARCHS, STFT_ARCHS
 
 
 def _resolve_cfg(cfg: dict, arch_label: str) -> dict:
     """Apply arch-specific overrides. Explicit cfg keys always win."""
-    overrides = {
-        "mobilenet":          MOBILENET_OVERRIDES,
-        "slow_fusion_se":     SE_OVERRIDES,
-        "slow_fusion_se_arc": SE_ARC_OVERRIDES,
-    }.get(arch_label, {})
+    overrides = {}
+    if arch_label == "mobilenet":
+        overrides = MOBILENET_OVERRIDES
+    elif arch_label in ("tcn_aot", "tcn_att"):
+        overrides = TCN_OVERRIDES
     return {**overrides, **cfg} if overrides else cfg
 
 
-def _make_loaders(data: dict, cfg: dict, device: torch.device):
+def _get_data_key(arch_label: str) -> str:
+    """Return the X data key suffix for this architecture."""
+    if arch_label in RAW_ARCHS:
+        return "raw"
+    return "stft"
+
+
+def _make_loaders(data: dict, cfg: dict, device: torch.device,
+                  data_suffix: str):
     bs  = cfg.get("batch_size", DEFAULTS["batch_size"])
     val = cfg.get("val_split",  DEFAULTS["val_split"])
 
-    X = torch.tensor(data["X_train"]).to(device)
+    X = torch.tensor(data[f"X_train_{data_suffix}"]).to(device)
     y = torch.tensor(data["y_train"], dtype=torch.long).to(device)
 
     dataset    = TensorDataset(X, y)
@@ -117,9 +121,9 @@ def train_one_subject(
     smoothing     = cfg.get("label_smoothing",   DEFAULTS["label_smoothing"])
     sched_type    = cfg.get("scheduler",         DEFAULTS["scheduler"])
 
-    train_loader, val_loader, train_size, val_size = _make_loaders(data, cfg, device)
-
-    arcface = getattr(model, "use_arcface", False)
+    data_suffix = _get_data_key(arch_label)
+    train_loader, val_loader, train_size, val_size = _make_loaders(
+        data, cfg, device, data_suffix)
 
     # ── Optimizer ────────────────────────────────────────────
     if hasattr(model, "get_param_groups"):
@@ -130,7 +134,6 @@ def train_one_subject(
 
     # ── Scheduler ────────────────────────────────────────────
     if sched_type == "cosine":
-        # Smooth decay to lr*0.01 over all epochs  [7]
         scheduler   = optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=epochs, eta_min=lr * 0.01)
         use_plateau = False
@@ -140,11 +143,8 @@ def train_one_subject(
         use_plateau = True
 
     # ── Loss ─────────────────────────────────────────────────
-    # ArcFace already regularises the angular space, so label smoothing
-    # is disabled for it — combining both would fight the margin objective.
-    effective_smoothing = 0.0 if arcface else smoothing
-    criterion     = nn.CrossEntropyLoss(label_smoothing=effective_smoothing)
-    val_criterion = nn.CrossEntropyLoss()   # always hard labels for val metric
+    criterion     = nn.CrossEntropyLoss(label_smoothing=smoothing)
+    val_criterion = nn.CrossEntropyLoss()
 
     lr_reductions = 0
     history       = []
@@ -159,8 +159,7 @@ def train_one_subject(
         train_loss = 0.0
         for xb, yb in train_loader:
             optimizer.zero_grad()
-            logits = model(xb, labels=yb) if arcface else model(xb)
-            loss   = criterion(logits, yb)
+            loss = criterion(model(xb), yb)
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * len(xb)
@@ -171,7 +170,7 @@ def train_one_subject(
         val_loss, correct = 0.0, 0
         with torch.no_grad():
             for xb, yb in val_loader:
-                out = model(xb)          # ArcFace: no labels → no margin
+                out = model(xb)
                 val_loss += val_criterion(out, yb).item() * len(xb)
                 correct  += (out.argmax(1) == yb).sum().item()
         val_loss /= val_size
