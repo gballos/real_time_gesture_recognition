@@ -4,10 +4,6 @@ data/ninaprodb5/s*/
 # ── Stage cache (large pickled numpy arrays) ─────────────────
 cache/*.pkl
  
-# ── Plots (reproducible from eval stage) ─────────────────────
-plots/*.png
-plots/*.pdf
- 
 # ── Python ───────────────────────────────────────────────────
 __pycache__/
 *.pyc
