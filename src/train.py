@@ -51,7 +51,7 @@ MOBILENET_OVERRIDES = dict(
 # Dropout is set in the architecture, not here.
 TCN_OVERRIDES = dict(
     lr                = 0.01,
-    epochs            = 30,
+    epochs            = 60,
     lr_patience       = 5,
     max_lr_reductions = 2,
 )
