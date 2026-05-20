@@ -1,29 +1,22 @@
 """
 architectures.py
 ================
-CNN architectures for EMG gesture classification.
+CNN/TCN architectures for EMG gesture classification.
 
-  SlowFusionEMG      — Option A:   replication of Côté-Allard et al. [1]
-  SlowFusionSE_EMG   — Option A+:  SE channel attention after each block
-  MobileNetV2EMG     — Option B:   honest ImageNet transfer learning baseline
+  SlowFusionEMG      — Option A:  Côté-Allard et al. [1] (Conv3d, STFT input)
+  TCN_EMG            — Option C:  Tsinganos et al. [9] (causal dilated 1D conv,
+                                  raw EMG input, AoT or Attention classifier)
+  MobileNetV2EMG     — Option B:  ImageNet transfer learning baseline (STFT input)
 
-Classifier heads:
-  - Linear (default): standard logit head + CrossEntropyLoss
-  - ArcFace:          additive angular margin head for inter-class separation
-
-Input to all: (N, 4, 8, 14)  — (Batch, Time, Channel, Freq)
-Output:       (N, n_classes)  — logits (or ArcFace cosines during training)
+Input conventions:
+  SlowFusion/MobileNet: (N, 4, 8, 14) — STFT spectrogram
+  TCN:                  (N, 8, T)      — raw EMG (8 channels, T time steps)
 
 References
 ----------
 [1]  Côté-Allard et al. (2019) "Deep Learning for EMG-Based ..."
-[2]  Hu et al. (2018) "Squeeze-and-Excitation Networks." CVPR.
-[3]  Altuwaijri et al. (2022) "Multi-Branch CNN with SE Attention
-     Blocks for EEG-Based Motor Imagery." Diagnostics 12(4).
-[4]  Deng et al. (2019) "ArcFace: Additive Angular Margin Loss
-     for Deep Face Recognition." CVPR.
-[5]  Song et al. (2024) "L3AM: Linear Adaptive Angular Margin
-     Loss for Video-Based Hand Gesture Authentication." IJCV 132(9).
+[9]  Tsinganos et al. (2019) "Improved Gesture Recognition Based on
+     sEMG Signals and TCN." ICASSP.
 """
 
 import math
@@ -34,77 +27,145 @@ from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
 
 
 # ════════════════════════════════════════════════════════════════
-# Building blocks
+# TCN building blocks  (Tsinganos et al. [9], Bai et al. [6])
 # ════════════════════════════════════════════════════════════════
 
-class SE3d(nn.Module):
+class CausalConv1d(nn.Module):
     """
-    Squeeze-and-Excitation block for 3D feature maps  [2][3].
-
-    GAP over (T,H,W) → FC(C→C//r) → ReLU → FC(C//r→C) → Sigmoid
-    Re-weights channels to emphasise discriminative frequency bands.
-    Overhead: 32-ch block = +40 params, 128-ch block = +544 params.
+    Causal (left-padded) dilated 1D convolution.
+    Output length == input length for any dilation.
     """
-    def __init__(self, channels: int, reduction: int = 4):
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int,
+                 dilation: int = 1):
         super().__init__()
-        mid = max(1, channels // reduction)
-        self.fc = nn.Sequential(
-            nn.Linear(channels, mid),
-            nn.ReLU(inplace=True),
-            nn.Linear(mid, channels),
-            nn.Sigmoid(),
-        )
+        self.pad = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size,
+                              dilation=dilation, padding=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (N, C, T, H, W)
-        w = x.mean(dim=(2, 3, 4))                                   # squeeze → (N,C)
-        w = self.fc(w).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)    # excite  → (N,C,1,1,1)
-        return x * w
+        # Left-pad so output only sees past + current
+        x = F.pad(x, (self.pad, 0))
+        return self.conv(x)
 
 
-class ArcFaceHead(nn.Module):
+class TemporalBlock(nn.Module):
     """
-    Additive Angular Margin classifier  [4][5].
+    One residual block: two causal dilated convs + residual connection.
 
-    Replaces the final Linear with a cosine-similarity head that inserts
-    angular margin m between a sample and its true class centre, widening
-    the decision boundary between geometrically close gestures.
+    CausalConv → BN → ReLU → Dropout → CausalConv → BN → ReLU → Dropout
+                                    + residual (1x1 conv if channels differ)
+    """
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int,
+                 dilation: int, dropout: float = 0.05):
+        super().__init__()
+        self.net = nn.Sequential(
+            CausalConv1d(in_ch, out_ch, kernel_size, dilation),
+            nn.BatchNorm1d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            CausalConv1d(out_ch, out_ch, kernel_size, dilation),
+            nn.BatchNorm1d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+        )
+        self.downsample = (nn.Conv1d(in_ch, out_ch, 1)
+                           if in_ch != out_ch else nn.Identity())
 
-    Train:  forward(x, labels) → margin logits × s
-    Eval:   forward(x)         → plain cosine logits × s  (no margin)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.relu(self.net(x) + self.downsample(x))
+
+
+class TemporalConvNet(nn.Module):
+    """
+    Stack of TemporalBlocks with exponentially growing dilation.
 
     Parameters
     ----------
-    s : scale factor (default 30.0)
-    m : angular margin in radians (default 0.50 ≈ 28.6°)
+    in_channels  : int — number of input channels (8 for EMG)
+    n_hidden     : int — hidden channel width for all blocks
+    n_layers     : int — number of TemporalBlocks (dilation = 2^i)
+    kernel_size  : int — conv kernel width (default 3)
+    dropout      : float
     """
-    def __init__(self, in_features: int, n_classes: int,
-                 s: float = 30.0, m: float = 0.50):
+    def __init__(self, in_channels: int = 8, n_hidden: int = 32,
+                 n_layers: int = 4, kernel_size: int = 3,
+                 dropout: float = 0.05):
         super().__init__()
-        self.s     = s
-        self.m     = m
-        self.cos_m = math.cos(m)
-        self.sin_m = math.sin(m)
-        self.th    = math.cos(math.pi - m)          # numerical stability threshold
-        self.mm    = math.sin(math.pi - m) * m
+        layers = []
+        for i in range(n_layers):
+            in_ch  = in_channels if i == 0 else n_hidden
+            layers.append(TemporalBlock(in_ch, n_hidden, kernel_size,
+                                        dilation=2**i, dropout=dropout))
+        self.network = nn.Sequential(*layers)
 
-        self.weight = nn.Parameter(torch.FloatTensor(n_classes, in_features))
-        nn.init.xavier_uniform_(self.weight)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x)       # (N, n_hidden, T)
 
-    def forward(self, x: torch.Tensor,
-                labels: torch.Tensor | None = None) -> torch.Tensor:
-        x_norm = F.normalize(x, dim=1)
-        w_norm = F.normalize(self.weight, dim=1)
-        cosine = F.linear(x_norm, w_norm)           # (N, n_classes)
 
-        if labels is None or not self.training:
-            return cosine * self.s
+class AttentionPool(nn.Module):
+    """
+    Attention-based temporal pooling  [9, Yang et al. 2016].
 
-        sine    = torch.sqrt(1.0 - cosine.pow(2).clamp(0, 1))
-        phi     = cosine * self.cos_m - sine * self.sin_m      # cos(θ+m)
-        phi     = torch.where(cosine > self.th, phi, cosine - self.mm)
-        one_hot = F.one_hot(labels, num_classes=cosine.size(1)).float()
-        return (one_hot * phi + (1.0 - one_hot) * cosine) * self.s
+    Learns per-timestep importance weights to produce a single
+    summary vector from the TCN output sequence.
+    """
+    def __init__(self, n_hidden: int):
+        super().__init__()
+        self.W_a = nn.Linear(n_hidden, n_hidden)
+        self.u_a = nn.Parameter(torch.randn(n_hidden))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, C, T) → transpose to (N, T, C)
+        x = x.transpose(1, 2)
+        v = torch.tanh(self.W_a(x))        # (N, T, C)
+        scores = (v * self.u_a).sum(dim=2)  # (N, T)
+        alpha  = torch.softmax(scores, dim=1).unsqueeze(2)  # (N, T, 1)
+        return (x * alpha).sum(dim=1)       # (N, C)
+
+
+class TCN_EMG(nn.Module):
+    """
+    TCN for raw EMG gesture classification  [9].
+
+    Input:  (N, 8, T) — raw 8-channel EMG, variable length T
+    Output: (N, n_classes)
+
+    Parameters
+    ----------
+    classifier : "aot" | "attention"
+        - "aot":       Average-over-Time (mean pool across T)
+        - "attention":  Learned attention pooling
+    n_layers   : int — 4 for short RF (~300ms), 7 for long RF (~2500ms)
+    n_hidden   : int — channel width (default 32)
+    """
+    def __init__(self, n_classes: int = 17, n_channels: int = 8,
+                 n_hidden: int = 32, n_layers: int = 4,
+                 kernel_size: int = 3, dropout: float = 0.05,
+                 classifier: str = "aot"):
+        super().__init__()
+        self.classifier_type = classifier
+
+        self.tcn = TemporalConvNet(
+            in_channels=n_channels, n_hidden=n_hidden,
+            n_layers=n_layers, kernel_size=kernel_size,
+            dropout=dropout,
+        )
+
+        if classifier == "attention":
+            self.pool = AttentionPool(n_hidden)
+        else:
+            self.pool = None   # AoT: simple mean
+
+        self.fc = nn.Linear(n_hidden, n_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, 8, T)
+        h = self.tcn(x)                              # (N, n_hidden, T)
+        if self.pool is not None:
+            s = self.pool(h)                          # (N, n_hidden)
+        else:
+            s = h.mean(dim=2)                         # AoT: (N, n_hidden)
+        return self.fc(s)                             # (N, n_classes)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -112,7 +173,7 @@ class ArcFaceHead(nn.Module):
 # ════════════════════════════════════════════════════════════════
 
 class SlowFusionEMG(nn.Module):
-    """Baseline replication of [1]. Unchanged."""
+    """Baseline replication of [1]. Input: (N, 4, 8, 14) STFT."""
 
     def __init__(self, n_classes: int = 17, dropout: float = 0.5):
         super().__init__()
@@ -143,82 +204,16 @@ class SlowFusionEMG(nn.Module):
 
 
 # ════════════════════════════════════════════════════════════════
-# Option A+ / A++ — SlowFusion + SE  ±  ArcFace
-# ════════════════════════════════════════════════════════════════
-
-class SlowFusionSE_EMG(nn.Module):
-    """
-    SlowFusion with SE3d channel attention after every conv block  [2][3].
-
-    use_arcface=False → "slow_fusion_se"      (SE only, Linear head)
-    use_arcface=True  → "slow_fusion_se_arc"  (SE + ArcFace head)
-
-    ArcFace forward contract:
-      model.train(); model(x, labels=y)  → margin logits
-      model.eval();  model(x)            → plain cosine logits
-    """
-
-    def __init__(self, n_classes: int = 17, dropout: float = 0.5,
-                 se_reduction: int = 4, use_arcface: bool = False,
-                 arc_s: float = 30.0, arc_m: float = 0.50):
-        super().__init__()
-        self.use_arcface = use_arcface
-
-        # ── Conv blocks (identical to SlowFusionEMG) ────────
-        self.block1 = nn.Sequential(
-            nn.Conv3d(1, 32, kernel_size=(1, 3, 3), padding=0),
-            nn.BatchNorm3d(32), nn.ReLU(inplace=True),
-        )
-        self.se1 = SE3d(32, se_reduction)
-
-        self.block2 = nn.Sequential(
-            nn.Conv3d(32, 64, kernel_size=(2, 3, 3), stride=(2, 1, 1), padding=0),
-            nn.BatchNorm3d(64), nn.ReLU(inplace=True),
-        )
-        self.se2 = SE3d(64, se_reduction)
-
-        self.block3 = nn.Sequential(
-            nn.Conv3d(64, 128, kernel_size=(2, 3, 3), padding=0),
-            nn.BatchNorm3d(128), nn.ReLU(inplace=True),
-        )
-        self.se3 = SE3d(128, se_reduction)
-
-        self.gap     = nn.AdaptiveAvgPool3d(1)
-        self.flatten = nn.Flatten()
-        self.dropout = nn.Dropout(dropout)
-
-        # ── Classifier head ──────────────────────────────────
-        if use_arcface:
-            self.classifier = ArcFaceHead(128, n_classes, s=arc_s, m=arc_m)
-        else:
-            self.classifier = nn.Linear(128, n_classes)
-
-    def forward(self, x: torch.Tensor,
-                labels: torch.Tensor | None = None) -> torch.Tensor:
-        x = x.unsqueeze(1)
-        x = self.se1(self.block1(x))
-        x = self.se2(self.block2(x))
-        x = self.se3(self.block3(x))
-        x = self.dropout(self.flatten(self.gap(x)))
-        if self.use_arcface:
-            return self.classifier(x, labels)
-        return self.classifier(x)
-
-
-# ════════════════════════════════════════════════════════════════
 # Option B — MobileNetV2  (honest transfer learning baseline)
 # ════════════════════════════════════════════════════════════════
 
 class MobileNetV2EMG(nn.Module):
-    """
-    MobileNetV2 for 4-channel EMG spectrograms.
-    freeze_until=7, differential LR groups, 64×64 upsample.
-    """
+    """MobileNetV2 for 4-channel STFT spectrograms. Input: (N, 4, 8, 14)."""
 
     def __init__(self, n_classes: int = 17, dropout: float = 0.5,
                  freeze_until: int = 7):
         super().__init__()
-        self._upsample    = (64, 64)
+        self._upsample     = (64, 64)
         self._freeze_until = freeze_until
 
         base = mobilenet_v2(weights=MobileNet_V2_Weights.IMAGENET1K_V1)
@@ -267,22 +262,29 @@ class MobileNetV2EMG(nn.Module):
 # Factory
 # ════════════════════════════════════════════════════════════════
 
-def build_model(name: str, n_classes: int = 17, dropout: float = 0.5) -> nn.Module:
+# Which architectures need STFT features vs raw EMG windows
+STFT_ARCHS = {"slow_fusion", "mobilenet"}
+RAW_ARCHS  = {"tcn_aot", "tcn_att"}
+
+
+def build_model(name: str, n_classes: int = 17,
+                dropout: float = 0.5) -> nn.Module:
     """
-    name : "slow_fusion" | "slow_fusion_se" | "slow_fusion_se_arc" | "mobilenet"
+    name : "slow_fusion" | "mobilenet" | "tcn_aot" | "tcn_att"
     """
     if name == "slow_fusion":
         return SlowFusionEMG(n_classes=n_classes, dropout=dropout)
-    elif name == "slow_fusion_se":
-        return SlowFusionSE_EMG(n_classes=n_classes, dropout=dropout, use_arcface=False)
-    elif name == "slow_fusion_se_arc":
-        return SlowFusionSE_EMG(n_classes=n_classes, dropout=dropout, use_arcface=True)
     elif name == "mobilenet":
         return MobileNetV2EMG(n_classes=n_classes, dropout=dropout)
+    elif name == "tcn_aot":
+        return TCN_EMG(n_classes=n_classes, n_hidden=32, n_layers=4,
+                       dropout=0.05, classifier="aot")
+    elif name == "tcn_att":
+        return TCN_EMG(n_classes=n_classes, n_hidden=32, n_layers=4,
+                       dropout=0.05, classifier="attention")
     else:
         raise ValueError(f"Unknown architecture: {name!r}. "
-                         "Choose 'slow_fusion', 'slow_fusion_se', "
-                         "'slow_fusion_se_arc', or 'mobilenet'.")
+                         "Choose 'slow_fusion', 'mobilenet', 'tcn_aot', or 'tcn_att'.")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -291,13 +293,23 @@ def build_model(name: str, n_classes: int = 17, dropout: float = 0.5) -> nn.Modu
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dummy  = torch.randn(8, 4, 8, 14).to(device)
-    labels = torch.randint(0, 17, (8,)).to(device)
 
-    for name in ("slow_fusion", "slow_fusion_se", "slow_fusion_se_arc", "mobilenet"):
+    # STFT architectures
+    dummy_stft = torch.randn(8, 4, 8, 14).to(device)
+    for name in ("slow_fusion",):
         m = build_model(name).to(device)
-        m.train()
-        out = m(dummy, labels=labels) if (hasattr(m, "use_arcface") and m.use_arcface) else m(dummy)
+        out = m(dummy_stft)
         total     = sum(p.numel() for p in m.parameters())
         trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
-        print(f"[{name:20s}]  out={tuple(out.shape)}  params={total:,}  trainable={trainable:,}")
+        print(f"[{name:15s}]  in={tuple(dummy_stft.shape)}  out={tuple(out.shape)}  "
+              f"params={total:,}  trainable={trainable:,}")
+
+    # Raw EMG architectures (T=52 samples = 260ms window)
+    dummy_raw = torch.randn(8, 8, 52).to(device)
+    for name in ("tcn_aot", "tcn_att"):
+        m = build_model(name).to(device)
+        out = m(dummy_raw)
+        total     = sum(p.numel() for p in m.parameters())
+        trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+        print(f"[{name:15s}]  in={tuple(dummy_raw.shape)}  out={tuple(out.shape)}  "
+              f"params={total:,}  trainable={trainable:,}")
