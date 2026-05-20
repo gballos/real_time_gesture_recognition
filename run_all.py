@@ -88,7 +88,7 @@ DEFAULT_CFG = dict(
     stft_noverlap = 20,
 
     # Training
-    architectures     = ["slow_fusion", "mobilenet"],
+    architectures     = ["slow_fusion", "mobilenet", "tcn_aot", "tcn_att"],
     epochs            = 30,
     batch_size        = 128,
     lr                = 0.00681,
@@ -299,10 +299,10 @@ def parse_args():
                    choices=STAGES, metavar="STAGE",
                    help="Start pipeline from this stage "
                         "(assumes previous stages already ran).")
-    ALL_ARCHS = ["slow_fusion", "slow_fusion_se", 
-                 "slow_fusion_se_arc", "mobilenet"]
-    p.add_argument("--arch", nargs="+", default=ALL_ARCHS,
-                   choices=ALL_ARCHS)  
+    ALL_ARCHS = ["slow_fusion", "mobilenet", "tcn_aot", "tcn_att"]
+    p.add_argument("--arch",       nargs="+", default=ALL_ARCHS,
+                   choices=ALL_ARCHS,
+                   help="Which architectures to run (default: all four).")
     p.add_argument("--list-stages", action="store_true",
                    help="Print available stages and exit.")
     p.add_argument("--data-dir",   default=DEFAULT_CFG["data_dir"])
