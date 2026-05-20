@@ -39,19 +39,22 @@ log = logging.getLogger(__name__)
 RT_BUDGET_MS = 40.0       # ms available for full pipeline  (300 - 260)
 N_WARMUP     = 50
 N_RUNS       = 500
-DUMMY_INPUT  = (1, 4, 8, 14)   # single spectrogram tensor
-DUMMY_WINDOW = (52, 8)         # single raw EMG window
+DUMMY_STFT   = (1, 4, 8, 14)   # single spectrogram tensor
+DUMMY_RAW    = (1, 8, 52)      # single raw EMG tensor (8ch, 52 samples)
+DUMMY_WINDOW = (52, 8)         # single raw EMG numpy window
 
 # STFT params matching feat_extract.py
 STFT_NPERSEG  = 28
 STFT_NOVERLAP = 20
 
 LABELS = {
-    "slow_fusion":       "[A] SlowFusion",
-    "slow_fusion_se":    "[A+] SlowFusion+SE",
-    "slow_fusion_se_arc":"[A++] SF+SE+ArcFace",
-    "mobilenet":         "[B] MobileNetV2",
+    "slow_fusion":  "[A] SlowFusion",
+    "mobilenet":    "[B] MobileNetV2",
+    "tcn_aot":      "[C] TCN-AoT",
+    "tcn_att":      "[C] TCN-Att",
 }
+
+from src.architectures import RAW_ARCHS
 
 
 # ─────────────────────────────────────────────
@@ -98,17 +101,14 @@ def model_footprint(model: nn.Module) -> dict:
 # FLOPs (network only — STFT is not a tensor op)
 # ─────────────────────────────────────────────
 
-def count_flops(model: nn.Module, device: torch.device) -> float | None:
+def count_flops(model: nn.Module, device: torch.device,
+                arch: str = "slow_fusion") -> float | None:
     """
     Returns GFLOPs for one forward pass, always measured on CPU.
-
-    Strategy (in priority order):
-      1. torch.utils.flop_counter.FlopCounterMode  (PyTorch >= 2.1)
-      2. thop.profile                              (pip install thop)
-      3. Returns None with warning
     """
     cpu_model = model.cpu().eval()
-    dummy = torch.randn(*DUMMY_INPUT)
+    dummy_shape = DUMMY_RAW if arch in RAW_ARCHS else DUMMY_STFT
+    dummy = torch.randn(*dummy_shape)
 
     flops = None
 
@@ -156,53 +156,52 @@ def required_gflops_per_sec(flops_g: float | None,
 # CPU latency — FULL PIPELINE
 # ─────────────────────────────────────────────
 
-def benchmark_latency(model: nn.Module,
+def benchmark_latency(model: nn.Module, arch: str = "slow_fusion",
                       n_warmup: int = N_WARMUP,
                       n_runs: int = N_RUNS) -> dict:
     """
-    Measures the full single-window pipeline on CPU:
-      raw EMG (52,8) → STFT → log1p → tensor → forward pass
+    Measures the full single-window pipeline on CPU.
 
-    Returns dict with:
-      preprocess_mean_ms, preprocess_p95_ms   — STFT + log1p + tensor conversion
-      network_mean_ms, network_p95_ms         — model forward pass only
-      total_mean_ms, total_p95_ms             — end-to-end
-      rt_ok                                   — total_p95_ms <= RT_BUDGET_MS
+    STFT architectures:  raw EMG (52,8) → STFT → log1p → tensor → forward
+    Raw architectures:   raw EMG (52,8) → transpose → tensor → forward
+                         (preprocessing = just numpy transpose + tensor conv)
+
+    Returns dict with preprocess/network/total breakdown and rt_ok flag.
     """
     cpu_model = model.cpu().eval()
     dummy_emg = np.random.randn(*DUMMY_WINDOW).astype(np.float32)
+    is_raw = arch in RAW_ARCHS
 
-    # ── Warmup (full pipeline) ───────────────────────────────
+    def _preprocess():
+        if is_raw:
+            # TCN: just transpose (52,8) → (1,8,52)
+            return dummy_emg.T[np.newaxis].astype(np.float32)
+        else:
+            return _preprocess_window(dummy_emg)
+
+    # ── Warmup ───────────────────────────────────────────────
     with torch.no_grad():
         for _ in range(n_warmup):
-            spec = _preprocess_window(dummy_emg)
-            cpu_model(torch.from_numpy(spec))
+            cpu_model(torch.from_numpy(_preprocess()))
 
     # ── Timed runs ───────────────────────────────────────────
-    preprocess_times = []
-    network_times    = []
-    total_times      = []
+    preprocess_times, network_times, total_times = [], [], []
 
     with torch.no_grad():
         for _ in range(n_runs):
             t_start = time.perf_counter()
-
-            # Step 1: preprocessing (STFT + log1p + reshape)
-            spec = _preprocess_window(dummy_emg)
+            arr = _preprocess()
             t_preprocess = time.perf_counter()
-
-            # Step 2: tensor conversion + forward pass
-            tensor = torch.from_numpy(spec)
-            cpu_model(tensor)
+            cpu_model(torch.from_numpy(arr))
             t_end = time.perf_counter()
 
             preprocess_times.append((t_preprocess - t_start) * 1000)
             network_times.append((t_end - t_preprocess) * 1000)
             total_times.append((t_end - t_start) * 1000)
 
-    pre  = np.array(preprocess_times)
-    net  = np.array(network_times)
-    tot  = np.array(total_times)
+    pre = np.array(preprocess_times)
+    net = np.array(network_times)
+    tot = np.array(total_times)
 
     return dict(
         # Preprocessing breakdown
@@ -241,12 +240,12 @@ def benchmark_all(trained_models: dict, device: torch.device) -> dict:
     for arch, models_by_sid in tqdm(trained_models.items(),
                                     desc="RT benchmark", unit="arch"):
         model = next(iter(models_by_sid.values()))
-        flops_g = count_flops(model, device)
+        flops_g = count_flops(model, device, arch=arch)
         rt[arch] = dict(
             footprint       = model_footprint(model),
             flops           = flops_g,
             required_gflops = required_gflops_per_sec(flops_g),
-            latency         = benchmark_latency(model),
+            latency         = benchmark_latency(model, arch=arch),
         )
         lat = rt[arch]["latency"]
         log.info("[%s] params=%s  size=%.1f MB  "
