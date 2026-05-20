@@ -352,16 +352,15 @@ def main():
 
     # Remove training params that the user did NOT explicitly set,
     # so arch-specific overrides in train.py can take effect.
-    for key in ("epochs", "batch_size", "lr"):
+    # batch_size is kept — no arch override changes it and it's
+    # needed directly by stage_eval.
+    for key in ("epochs", "lr"):
         cli_val = getattr(args, key)
         if cli_val == DEFAULT_CFG[key]:
-            # User didn't override — remove from cfg so _resolve_cfg
-            # can apply arch-specific values.  DEFAULTS in train.py
-            # serves as the final fallback.
             cfg.pop(key, None)
         else:
-            # User explicitly set a non-default value — keep it.
             cfg[key] = cli_val
+    cfg["batch_size"] = args.batch_size
 
     os.makedirs(cfg["models_dir"], exist_ok=True)
     os.makedirs(cfg["plots_dir"],  exist_ok=True)
