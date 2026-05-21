@@ -2,14 +2,7 @@
 eval.py
 =======
 Evaluation utilities: test-set metrics + visualisation.
-
-Functions
----------
-  evaluate_model()     — accuracy, macro F1, confusion matrix for one model/subject
-  evaluate_all()       — runs evaluate_model over all subjects, returns summary dict
-  plot_comparison()    — bar charts: accuracy, F1 per subject for both architectures
-  plot_confusion()     — side-by-side confusion matrices for a given subject
-  print_summary()      — formatted table to stdout
+Handles both STFT and raw EMG input architectures.
 """
 
 import logging
@@ -22,27 +15,41 @@ import torch
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 from tqdm import tqdm
 
+from src.architectures import RAW_ARCHS
+
 log = logging.getLogger(__name__)
 
 N_CLASSES = 17
-PAPER_ACC = 0.6898   # Côté-Allard [1] reference for spectrogram model
+PAPER_ACC = 0.6898   # Côté-Allard [1] reference
+
+COLORS = {
+    "slow_fusion":  "steelblue",
+    "mobilenet":    "coral",
+    "tcn_aot":      "seagreen",
+    "tcn_att":      "mediumpurple",
+}
+LABELS = {
+    "slow_fusion":  "[A] SlowFusion",
+    "mobilenet":    "[B] MobileNetV2",
+    "tcn_aot":      "[C] TCN-AoT",
+    "tcn_att":      "[C] TCN-Att",
+}
 
 
-# ─────────────────────────────────────────────
-# Single model / subject
-# ─────────────────────────────────────────────
+def _get_x_test(data: dict, arch: str) -> np.ndarray:
+    """Return the correct test input for this architecture."""
+    if arch in RAW_ARCHS:
+        return data["X_test_raw"]
+    return data["X_test_stft"]
+
 
 @torch.no_grad()
 def evaluate_model(model: torch.nn.Module,
                    data: dict,
                    device: torch.device,
+                   arch: str = "slow_fusion",
                    batch_size: int = 128) -> dict:
-    """
-    Returns
-    -------
-    dict with keys: acc, f1, cm  (confusion matrix ndarray)
-    """
-    X_test = torch.tensor(data["X_test"]).to(device)
+    X_test = torch.tensor(_get_x_test(data, arch)).to(device)
     y_true = data["y_test"]
 
     model.eval()
@@ -59,30 +66,17 @@ def evaluate_model(model: torch.nn.Module,
     return dict(acc=acc, f1=f1, cm=cm)
 
 
-# ─────────────────────────────────────────────
-# All subjects × all architectures
-# ─────────────────────────────────────────────
-
 def evaluate_all(trained_models: dict,
                  stft_data: dict,
                  device: torch.device,
                  batch_size: int = 128) -> dict:
-    """
-    Parameters
-    ----------
-    trained_models : {arch_name -> {sid -> nn.Module}}
-    stft_data      : {sid -> {"X_test", "y_test", ...}}
-
-    Returns
-    -------
-    results : {arch_name -> {sid -> {acc, f1, cm}}}
-    """
     results = {}
     for arch, models_by_sid in trained_models.items():
         results[arch] = {}
         for sid in tqdm(models_by_sid, desc=f"Evaluating [{arch}]", unit="subject"):
             results[arch][sid] = evaluate_model(
-                models_by_sid[sid], stft_data[sid], device, batch_size
+                models_by_sid[sid], stft_data[sid], device,
+                arch=arch, batch_size=batch_size
             )
             log.info("[%s][%s] acc=%.3f  f1=%.3f",
                      arch, sid,
@@ -91,16 +85,9 @@ def evaluate_all(trained_models: dict,
     return results
 
 
-# ─────────────────────────────────────────────
-# Visualisation
-# ─────────────────────────────────────────────
-
-COLORS = {"slow_fusion": "steelblue", "mobilenet": "coral"}
-LABELS = {"slow_fusion": "[A] SlowFusion", "mobilenet": "[B] MobileNetV2"}
-
+# ── Visualisation (unchanged logic, updated labels/colors) ───
 
 def plot_comparison(results: dict, save_path: str | None = None) -> None:
-    """Bar charts: accuracy and macro F1 per subject for each architecture."""
     archs = list(results.keys())
     sids  = list(next(iter(results.values())).keys())
     x     = np.arange(len(sids))
@@ -139,7 +126,6 @@ def plot_comparison(results: dict, save_path: str | None = None) -> None:
 
 def plot_confusion(results: dict, sid: str,
                    save_path: str | None = None) -> None:
-    """Side-by-side confusion matrices for one subject."""
     archs = list(results.keys())
     fig, axes = plt.subplots(1, len(archs),
                              figsize=(7 * len(archs), 6))
@@ -147,7 +133,7 @@ def plot_confusion(results: dict, sid: str,
         axes = [axes]
 
     fig.suptitle(f"Confusion Matrices — {sid}", fontsize=13, fontweight="bold")
-    cmaps = ["Blues", "Oranges", "Greens"]
+    cmaps = ["Blues", "Oranges", "Greens", "Purples"]
 
     for ax, arch, cmap in zip(axes, archs, cmaps):
         cm = results[arch][sid]["cm"]
@@ -164,10 +150,6 @@ def plot_confusion(results: dict, sid: str,
         log.info("Saved confusion matrix → %s", save_path)
     plt.show()
 
-
-# ─────────────────────────────────────────────
-# Summary table
-# ─────────────────────────────────────────────
 
 def print_summary(results: dict) -> None:
     archs = list(results.keys())

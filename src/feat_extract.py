@@ -1,19 +1,19 @@
 """
 feat_extract.py
 ===============
-Sliding-window segmentation → STFT spectrogram features.
+Sliding-window segmentation → features.
 
-Pipeline per subject:
-  raw EMG split
-    → make_windows()          (N, 52, 8) + labels
-    → window_to_spectrogram() (N, 4, 8, 14)
-    → labels remapped 1..17 → 0..16
-
-All parameters from Côté-Allard et al. [1] unless noted.
+Two output modes (controlled by caller):
+  1. STFT path:  make_windows → window_to_spectrogram → (N, 4, 8, 14)
+                 Used by SlowFusion, MobileNet
+  2. RAW path:   make_windows → transpose → (N, 8, T)
+                 Used by TCN (no spectrogram, operates on raw EMG)
 
 Usage:
   from src.feat_extract import extract_all
   stft_data = extract_all(splits, cfg)
+  # stft_data[sid]["X_train_stft"] shape: (N, 4, 8, 14)
+  # stft_data[sid]["X_train_raw"]  shape: (N, 8, 52)
 """
 
 import logging
@@ -23,12 +23,12 @@ from tqdm import tqdm
 
 log = logging.getLogger(__name__)
 
-# ── Defaults (overridable via cfg) ───────────────────────────
-WINDOW_SIZE  = 52    # samples — 260 ms @ 200 Hz  [1]
-STEP         = 5     # samples — 25 ms step        [1]
-STFT_NPERSEG = 28    # Hann window length           [1]
-STFT_NOVERLAP = 20   # overlap → step=8             [1]
-N_CLASSES    = 17    # gestures 1..17 → 0..16
+# ── Defaults ─────────────────────────────────────────────────
+WINDOW_SIZE   = 52    # samples — 260 ms @ 200 Hz  [1]
+STEP          = 5     # samples — 25 ms step        [1]
+STFT_NPERSEG  = 28    # Hann window length           [1]
+STFT_NOVERLAP = 20    # overlap → step=8             [1]
+N_CLASSES     = 17
 
 
 # ─────────────────────────────────────────────
@@ -40,23 +40,18 @@ def make_windows(emg: np.ndarray, stimulus: np.ndarray,
     """
     Segment continuous EMG into overlapping windows.
 
-    Parameters
-    ----------
-    emg      : (N, 8)  float32
-    stimulus : (N,)    int32   — restimulus labels (0=rest, 1..17=gesture)
-
     Returns
     -------
     X : (n_windows, window_size, 8)  float32
-    y : (n_windows,)                 int32    — majority label, rest filtered, remapped 0..16
+    y : (n_windows,)                 int32    — rest filtered, remapped 0..16
     """
     X_list, y_list = [], []
     n = len(emg)
 
     for start in range(0, n - window_size + 1, step):
         end    = start + window_size
-        window = emg[start:end]                        # (52, 8)
-        labels = stimulus[start:end]                   # (52,)
+        window = emg[start:end]
+        labels = stimulus[start:end]
 
         vals, counts = np.unique(labels, return_counts=True)
         majority     = vals[np.argmax(counts)]
@@ -78,7 +73,7 @@ def make_windows(emg: np.ndarray, stimulus: np.ndarray,
 
 
 # ─────────────────────────────────────────────
-# STFT spectrogram
+# STFT spectrogram (for SlowFusion / MobileNet)
 # ─────────────────────────────────────────────
 
 def window_to_spectrogram(window: np.ndarray,
@@ -100,10 +95,7 @@ def window_to_spectrogram(window: np.ndarray,
                          noverlap=noverlap, window="hann")
         mag = np.abs(Zxx)       # (15, 4)
         mag = mag[1:, :4]       # drop DC bin → (14, 4)
-
-        # Log-compress bc EMG spectrograms are very sparse and skewed.
         mag = np.log1p(mag)
-
         specs.append(mag)       # (14, 4)
 
     specs = np.stack(specs, axis=0)          # (8, 14, 4)
@@ -115,12 +107,22 @@ def _compute_spectrograms(X_windows: np.ndarray,
                            nperseg: int, noverlap: int,
                            desc: str = "") -> np.ndarray:
     """Vectorised wrapper with progress bar."""
-    out = np.stack(
+    return np.stack(
         [window_to_spectrogram(w, nperseg, noverlap)
          for w in tqdm(X_windows, desc=desc, leave=False, unit="win")],
         axis=0,
-    )
-    return out   # (N, 4, 8, 14)
+    )   # (N, 4, 8, 14)
+
+
+# ─────────────────────────────────────────────
+# Raw EMG windows (for TCN)
+# ─────────────────────────────────────────────
+
+def _windows_to_raw(X_windows: np.ndarray) -> np.ndarray:
+    """
+    Transpose windowed EMG from (N, T, 8) → (N, 8, T) for Conv1d input.
+    """
+    return X_windows.transpose(0, 2, 1).astype(np.float32)  # (N, 8, T)
 
 
 # ─────────────────────────────────────────────
@@ -137,29 +139,40 @@ def extract_all(splits: dict, cfg: dict) -> dict:
 
     Returns
     -------
-    stft_data : {sid -> {"X_train", "y_train", "X_test", "y_test"}}
-                 X shape: (N, 4, 8, 14)   y shape: (N,)  values 0..16
+    data : {sid -> {"X_train_stft", "X_train_raw", "y_train",
+                    "X_test_stft",  "X_test_raw",  "y_test"}}
+           STFT shape: (N, 4, 8, 14)
+           Raw  shape: (N, 8, 52)
+           y    shape: (N,)  values 0..16
     """
     ws  = cfg.get("window_size",   WINDOW_SIZE)
     st  = cfg.get("step",          STEP)
     nps = cfg.get("stft_nperseg",  STFT_NPERSEG)
     nov = cfg.get("stft_noverlap", STFT_NOVERLAP)
 
-    stft_data = {}
+    all_data = {}
 
     for sid, sp in tqdm(splits.items(), desc="Feature extraction", unit="subject"):
         X_tr, y_tr = make_windows(sp["train"]["emg"], sp["train"]["stimulus"], ws, st)
         X_te, y_te = make_windows(sp["test"]["emg"],  sp["test"]["stimulus"],  ws, st)
 
-        X_tr = _compute_spectrograms(X_tr, nps, nov, desc=f"{sid} train")
-        X_te = _compute_spectrograms(X_te, nps, nov, desc=f"{sid} test")
+        # STFT path (for SlowFusion / MobileNet)
+        X_tr_stft = _compute_spectrograms(X_tr, nps, nov, desc=f"{sid} train")
+        X_te_stft = _compute_spectrograms(X_te, nps, nov, desc=f"{sid} test")
 
-        stft_data[sid] = {
-            "X_train": X_tr, "y_train": y_tr,
-            "X_test":  X_te, "y_test":  y_te,
+        # Raw path (for TCN) — just transpose, no STFT
+        X_tr_raw = _windows_to_raw(X_tr)
+        X_te_raw = _windows_to_raw(X_te)
+
+        all_data[sid] = {
+            "X_train_stft": X_tr_stft, "X_test_stft": X_te_stft,
+            "X_train_raw":  X_tr_raw,  "X_test_raw":  X_te_raw,
+            "y_train": y_tr, "y_test": y_te,
         }
 
-        log.info("%s | X_train %s  X_test %s | classes %s",
-                 sid, X_tr.shape, X_te.shape, np.unique(y_tr).tolist())
+        log.info("%s | STFT train %s  test %s | Raw train %s  test %s | classes %s",
+                 sid, X_tr_stft.shape, X_te_stft.shape,
+                 X_tr_raw.shape, X_te_raw.shape,
+                 np.unique(y_tr).tolist())
 
-    return stft_data
+    return all_data

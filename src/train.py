@@ -1,21 +1,21 @@
 """
 train.py
 ========
-Training loop shared by both architectures.
+Training loop shared by all architectures.
 
-Features:
-  - tqdm progress bars (epoch + batch level)
-  - ReduceLROnPlateau + early stopping matching [1]
-  - Per-epoch history (train_loss, val_loss, val_acc)
-  - Checkpoint saving to models/
-  - Resumes from checkpoint if one exists (optional)
+Handles two input conventions:
+  - STFT architectures (slow_fusion, mobilenet): use X_train_stft / X_test_stft
+  - Raw architectures  (tcn_aot, tcn_att):       use X_train_raw  / X_test_raw
+
+References
+----------
+[1]  Côté-Allard et al. (2019) — SlowFusion defaults
+[9]  Tsinganos et al. (2019) — TCN defaults
 """
 
 import logging
 import os
-import time
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -30,37 +30,59 @@ DEFAULTS = dict(
     lr                = 0.00681,
     epochs            = 30,
     val_split         = 0.1,
-    lr_factor         = 0.2,    # annealing factor 1/5 from [1]
+    lr_factor         = 0.2,
     lr_patience       = 3,
-    max_lr_reductions = 2,      # stop after 2 reductions [1]
+    max_lr_reductions = 2,
     dropout           = 0.5,
+    label_smoothing   = 0.0,
+    scheduler         = "plateau",
 )
 
-# MobileNet needs more epochs and a more patient scheduler because
-# three differential LR groups converge more slowly than a single LR.
+# MobileNet: more epochs + patient scheduler + label smoothing + cosine LR
 MOBILENET_OVERRIDES = dict(
     epochs            = 60,
     lr_patience       = 5,
     max_lr_reductions = 3,
+    label_smoothing   = 0.1,
+    scheduler         = "cosine",
 )
+
+# TCN: matches [9] — lr=0.01, 30 epochs, dropout=0.05
+# Dropout is set in the architecture, not here.
+TCN_OVERRIDES = dict(
+    lr                = 0.01,
+    epochs            = 60,
+    lr_patience       = 5,
+    max_lr_reductions = 2,
+)
+
+# Which architectures use raw EMG vs STFT
+from src.architectures import RAW_ARCHS, STFT_ARCHS
 
 
 def _resolve_cfg(cfg: dict, arch_label: str) -> dict:
-    """
-    Return a cfg dict with architecture-specific overrides applied.
-    Keys already set explicitly in cfg take precedence over overrides.
-    """
+    """Apply arch-specific overrides. Explicit cfg keys always win."""
+    overrides = {}
     if arch_label == "mobilenet":
-        merged = {**MOBILENET_OVERRIDES, **cfg}
-        return merged
-    return cfg
+        overrides = MOBILENET_OVERRIDES
+    elif arch_label in ("tcn_aot", "tcn_att"):
+        overrides = TCN_OVERRIDES
+    return {**overrides, **cfg} if overrides else cfg
 
 
-def _make_loaders(data: dict, cfg: dict, device: torch.device):
+def _get_data_key(arch_label: str) -> str:
+    """Return the X data key suffix for this architecture."""
+    if arch_label in RAW_ARCHS:
+        return "raw"
+    return "stft"
+
+
+def _make_loaders(data: dict, cfg: dict, device: torch.device,
+                  data_suffix: str):
     bs  = cfg.get("batch_size", DEFAULTS["batch_size"])
     val = cfg.get("val_split",  DEFAULTS["val_split"])
 
-    X = torch.tensor(data["X_train"]).to(device)
+    X = torch.tensor(data[f"X_train_{data_suffix}"]).to(device)
     y = torch.tensor(data["y_train"], dtype=torch.long).to(device)
 
     dataset    = TensorDataset(X, y)
@@ -68,9 +90,9 @@ def _make_loaders(data: dict, cfg: dict, device: torch.device):
     train_size = len(dataset) - val_size
     train_ds, val_ds = random_split(dataset, [train_size, val_size])
 
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=bs, shuffle=False)
-    return train_loader, val_loader, train_size, val_size
+    return (DataLoader(train_ds, batch_size=bs, shuffle=True),
+            DataLoader(val_ds,   batch_size=bs, shuffle=False),
+            train_size, val_size)
 
 
 def train_one_subject(
@@ -90,27 +112,39 @@ def train_one_subject(
     model   : trained nn.Module
     history : list of dicts  {epoch, train_loss, val_loss, val_acc, lr}
     """
-    cfg = _resolve_cfg(cfg, arch_label)
+    cfg           = _resolve_cfg(cfg, arch_label)
     epochs        = cfg.get("epochs",            DEFAULTS["epochs"])
     lr            = cfg.get("lr",                DEFAULTS["lr"])
     lr_factor     = cfg.get("lr_factor",         DEFAULTS["lr_factor"])
     lr_patience   = cfg.get("lr_patience",       DEFAULTS["lr_patience"])
     max_reductions= cfg.get("max_lr_reductions", DEFAULTS["max_lr_reductions"])
+    smoothing     = cfg.get("label_smoothing",   DEFAULTS["label_smoothing"])
+    sched_type    = cfg.get("scheduler",         DEFAULTS["scheduler"])
 
-    train_loader, val_loader, train_size, val_size = _make_loaders(data, cfg, device)
+    data_suffix = _get_data_key(arch_label)
+    train_loader, val_loader, train_size, val_size = _make_loaders(
+        data, cfg, device, data_suffix)
 
-    # Use differential LR param groups when the model supports it (MobileNet),
-    # otherwise fall back to a flat single-LR over all trainable params.
+    # ── Optimizer ────────────────────────────────────────────
     if hasattr(model, "get_param_groups"):
         param_groups = model.get_param_groups(lr)
     else:
         param_groups = filter(lambda p: p.requires_grad, model.parameters())
+    optimizer = optim.Adam(param_groups, lr=lr)
 
-    optimizer  = optim.Adam(param_groups, lr=lr)
-    scheduler  = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=lr_factor, patience=lr_patience
-    )
-    criterion  = nn.CrossEntropyLoss()
+    # ── Scheduler ────────────────────────────────────────────
+    if sched_type == "cosine":
+        scheduler   = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs, eta_min=lr * 0.01)
+        use_plateau = False
+    else:
+        scheduler   = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=lr_factor, patience=lr_patience)
+        use_plateau = True
+
+    # ── Loss ─────────────────────────────────────────────────
+    criterion     = nn.CrossEntropyLoss(label_smoothing=smoothing)
+    val_criterion = nn.CrossEntropyLoss()
 
     lr_reductions = 0
     history       = []
@@ -137,7 +171,7 @@ def train_one_subject(
         with torch.no_grad():
             for xb, yb in val_loader:
                 out = model(xb)
-                val_loss += criterion(out, yb).item() * len(xb)
+                val_loss += val_criterion(out, yb).item() * len(xb)
                 correct  += (out.argmax(1) == yb).sum().item()
         val_loss /= val_size
         val_acc   = correct / val_size
@@ -145,32 +179,31 @@ def train_one_subject(
         current_lr = optimizer.param_groups[0]["lr"]
         history.append(dict(epoch=epoch, train_loss=train_loss,
                             val_loss=val_loss, val_acc=val_acc, lr=current_lr))
-
         epoch_bar.set_postfix(
-            train_loss=f"{train_loss:.4f}",
-            val_loss=f"{val_loss:.4f}",
-            val_acc=f"{val_acc:.3f}",
-            lr=f"{current_lr:.2e}",
+            train_loss=f"{train_loss:.4f}", val_loss=f"{val_loss:.4f}",
+            val_acc=f"{val_acc:.3f}", lr=f"{current_lr:.2e}",
         )
 
-        # ── Early stopping ───────────────────────────────────
-        prev_lr = current_lr
-        scheduler.step(val_loss)
-        if optimizer.param_groups[0]["lr"] < prev_lr:
-            lr_reductions += 1
-            log.debug("[%s][%s] LR reduced → %d/%d",
-                      sid, arch_label, lr_reductions, max_reductions)
-            if lr_reductions >= max_reductions:
-                log.info("[%s][%s] Early stopping at epoch %d.",
-                         sid, arch_label, epoch)
-                break
+        # ── LR scheduling + early stopping ───────────────────
+        if use_plateau:
+            prev_lr = current_lr
+            scheduler.step(val_loss)
+            if optimizer.param_groups[0]["lr"] < prev_lr:
+                lr_reductions += 1
+                log.debug("[%s][%s] LR reduced → %d/%d",
+                          sid, arch_label, lr_reductions, max_reductions)
+                if lr_reductions >= max_reductions:
+                    log.info("[%s][%s] Early stopping at epoch %d.",
+                             sid, arch_label, epoch)
+                    break
+        else:
+            scheduler.step()
 
     # ── Save checkpoint ──────────────────────────────────────
     if checkpoint_path:
         os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
         torch.save({"model_state": model.state_dict(),
-                    "history":     history,
-                    "cfg":         cfg}, checkpoint_path)
+                    "history": history, "cfg": cfg}, checkpoint_path)
         log.info("Checkpoint saved → %s", checkpoint_path)
 
     return model, history

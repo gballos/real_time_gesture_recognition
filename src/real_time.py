@@ -3,21 +3,23 @@ real_time.py
 ============
 Real-time feasibility analysis for each architecture.
 
+Measures the FULL inference pipeline per window, not just the network:
+  1. STFT spectrogram extraction  (scipy.signal.stft, 8 channels)
+  2. log1p compression + reshape
+  3. Tensor conversion
+  4. Network forward pass
+
 Metrics
 -------
   1. Parameter count              (total + trainable)
   2. Model size on disk           (MB)
-  3. FLOPs for one inference      (GFLOPs) via thop if available
-  4. CPU latency per window       (ms, mean ± std over N runs)
-  5. Real-time budget check       (acquisition 260 ms + inference <= 300 ms)
-                                   -> inference must be <= 40 ms on CPU
+  3. FLOPs for one inference      (GFLOPs)
+  4. Full pipeline CPU latency    (ms, mean +/- std over N runs)
+     — broken down: preprocessing vs network
+  5. Real-time budget check       (acquisition 260 ms + pipeline <= 300 ms)
+                                   -> pipeline must be <= 40 ms on CPU
 
 The 300 ms perceptual limit is from Farrell & Weir (2007) as cited in [1].
-
-Usage:
-  from src.real_time import benchmark_all, print_rt_report, plot_rt_comparison
-  rt = benchmark_all(trained_models, device)
-  print_rt_report(rt)
 """
 
 import io
@@ -29,15 +31,55 @@ import numpy as np
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
+from scipy.signal import stft
 from tqdm import tqdm
 
 log = logging.getLogger(__name__)
 
-RT_BUDGET_MS = 40.0       # ms available for inference  (300 - 260)
+RT_BUDGET_MS = 40.0       # ms available for full pipeline  (300 - 260)
 N_WARMUP     = 50
 N_RUNS       = 500
-DUMMY_INPUT  = (1, 4, 8, 14)   # single window
-LABELS = {"slow_fusion": "[A] SlowFusion", "mobilenet": "[B] MobileNetV2"}
+DUMMY_STFT   = (1, 4, 8, 14)   # single spectrogram tensor
+DUMMY_RAW    = (1, 8, 52)      # single raw EMG tensor (8ch, 52 samples)
+DUMMY_WINDOW = (52, 8)         # single raw EMG numpy window
+
+# STFT params matching feat_extract.py
+STFT_NPERSEG  = 28
+STFT_NOVERLAP = 20
+
+LABELS = {
+    "slow_fusion":  "[A] SlowFusion",
+    "mobilenet":    "[B] MobileNetV2",
+    "tcn_aot":      "[C] TCN-AoT",
+    "tcn_att":      "[C] TCN-Att",
+}
+
+from src.architectures import RAW_ARCHS
+
+
+# ─────────────────────────────────────────────
+# Preprocessing (mirrors feat_extract.window_to_spectrogram)
+# ─────────────────────────────────────────────
+
+def _preprocess_window(window: np.ndarray,
+                       nperseg: int = STFT_NPERSEG,
+                       noverlap: int = STFT_NOVERLAP) -> np.ndarray:
+    """
+    Convert one raw EMG window (52, 8) → spectrogram (1, 4, 8, 14) float32.
+    Identical to feat_extract.window_to_spectrogram but kept local to avoid
+    circular imports and to make the benchmark self-contained.
+    """
+    specs = []
+    for ch in range(window.shape[1]):
+        _, _, Zxx = stft(window[:, ch], nperseg=nperseg,
+                         noverlap=noverlap, window="hann")
+        mag = np.abs(Zxx)        # (15, 4)
+        mag = mag[1:, :4]        # drop DC → (14, 4)
+        mag = np.log1p(mag)
+        specs.append(mag)        # (14, 4)
+    specs = np.stack(specs, axis=0)          # (8, 14, 4)
+    specs = specs.transpose(2, 0, 1)         # (4, 8, 14)
+    return specs.astype(np.float32)[np.newaxis]  # (1, 4, 8, 14)
 
 
 # ─────────────────────────────────────────────
@@ -56,49 +98,54 @@ def model_footprint(model: nn.Module) -> dict:
 
 
 # ─────────────────────────────────────────────
-# FLOPs (uses thop if available, else skips)
+# FLOPs (network only — STFT is not a tensor op)
 # ─────────────────────────────────────────────
 
-def count_flops(model: nn.Module, device: torch.device):
+def count_flops(model: nn.Module, device: torch.device,
+                arch: str = "slow_fusion") -> float | None:
     """
-    Returns GFLOPs for one forward pass measured on CPU.
+    Returns GFLOPs for one forward pass, always measured on CPU.
+    """
+    cpu_model = model.cpu().eval()
+    dummy_shape = DUMMY_RAW if arch in RAW_ARCHS else DUMMY_STFT
+    dummy = torch.randn(*dummy_shape)
 
-    Always uses CPU regardless of `device` so the FLOP count is on the same
-    hardware as benchmark_latency — keeping required_gflops_per_sec meaningful.
-    Returns None if thop is not installed.
-    """
+    flops = None
+
     try:
-        from thop import profile
-        cpu_model = model.cpu()
-        dummy = torch.randn(*DUMMY_INPUT)   # CPU tensor
+        from torch.utils.flop_counter import FlopCounterMode
         with torch.no_grad():
-            flops, _ = profile(cpu_model, inputs=(dummy,), verbose=False)
-        model.to(device)   # restore original device
-        return flops / 1e9
-    except ImportError:
-        log.warning("thop not installed — skipping FLOP count. "
-                    "Install with: pip install thop")
+            with FlopCounterMode(cpu_model, display=False) as fcm:
+                cpu_model(dummy)
+        flops = fcm.get_total_flops()
+    except (ImportError, AttributeError):
+        pass
+
+    if flops is None:
+        try:
+            from thop import profile as thop_profile
+            with torch.no_grad():
+                flops, _ = thop_profile(cpu_model, inputs=(dummy,), verbose=False)
+        except ImportError:
+            pass
+
+    model.to(device)
+
+    if flops is None:
+        log.warning(
+            "FLOPs could not be counted. "
+            "PyTorch >= 2.1 required for native counting, or: pip install thop"
+        )
         return None
+
+    return flops / 1e9
 
 
 def required_gflops_per_sec(flops_g: float | None,
                              budget_ms: float = RT_BUDGET_MS) -> float | None:
     """
-    Minimum sustained GFLOP/s a processor must deliver to meet the RT budget.
-
-      required = GFLOPs_per_inference / budget_in_seconds
-
-    This is a theoretical lower bound assuming 100% utilisation with no
-    overhead — real hardware needs headroom above this figure.
-
-    Parameters
-    ----------
-    flops_g   : GFLOPs per inference (from count_flops)
-    budget_ms : inference time budget in ms (default RT_BUDGET_MS = 40 ms)
-
-    Returns
-    -------
-    float  GFLOP/s required, or None if flops_g is None
+    Min sustained GFLOP/s to meet the RT budget (theoretical lower bound).
+    Note: this covers only the network forward pass, not preprocessing.
     """
     if flops_g is None:
         return None
@@ -106,37 +153,72 @@ def required_gflops_per_sec(flops_g: float | None,
 
 
 # ─────────────────────────────────────────────
-# CPU latency
+# CPU latency — FULL PIPELINE
 # ─────────────────────────────────────────────
 
-def benchmark_latency(model: nn.Module,
+def benchmark_latency(model: nn.Module, arch: str = "slow_fusion",
                       n_warmup: int = N_WARMUP,
                       n_runs: int = N_RUNS) -> dict:
     """
-    Measures single-window CPU inference time.
-    Returns dict: mean_ms, std_ms, min_ms, max_ms, p95_ms, rt_ok
+    Measures the full single-window pipeline on CPU.
+
+    STFT architectures:  raw EMG (52,8) → STFT → log1p → tensor → forward
+    Raw architectures:   raw EMG (52,8) → transpose → tensor → forward
+                         (preprocessing = just numpy transpose + tensor conv)
+
+    Returns dict with preprocess/network/total breakdown and rt_ok flag.
     """
     cpu_model = model.cpu().eval()
-    dummy     = torch.randn(*DUMMY_INPUT)
+    dummy_emg = np.random.randn(*DUMMY_WINDOW).astype(np.float32)
+    is_raw = arch in RAW_ARCHS
 
+    def _preprocess():
+        if is_raw:
+            # TCN: just transpose (52,8) → (1,8,52)
+            return dummy_emg.T[np.newaxis].astype(np.float32)
+        else:
+            return _preprocess_window(dummy_emg)
+
+    # ── Warmup ───────────────────────────────────────────────
     with torch.no_grad():
         for _ in range(n_warmup):
-            cpu_model(dummy)
+            cpu_model(torch.from_numpy(_preprocess()))
 
-        times = []
+    # ── Timed runs ───────────────────────────────────────────
+    preprocess_times, network_times, total_times = [], [], []
+
+    with torch.no_grad():
         for _ in range(n_runs):
-            t0 = time.perf_counter()
-            cpu_model(dummy)
-            times.append((time.perf_counter() - t0) * 1000)
+            t_start = time.perf_counter()
+            arr = _preprocess()
+            t_preprocess = time.perf_counter()
+            cpu_model(torch.from_numpy(arr))
+            t_end = time.perf_counter()
 
-    times = np.array(times)
+            preprocess_times.append((t_preprocess - t_start) * 1000)
+            network_times.append((t_end - t_preprocess) * 1000)
+            total_times.append((t_end - t_start) * 1000)
+
+    pre = np.array(preprocess_times)
+    net = np.array(network_times)
+    tot = np.array(total_times)
+
     return dict(
-        mean_ms = float(np.mean(times)),
-        std_ms  = float(np.std(times)),
-        min_ms  = float(np.min(times)),
-        max_ms  = float(np.max(times)),
-        p95_ms  = float(np.percentile(times, 95)),
-        rt_ok   = float(np.percentile(times, 95)) <= RT_BUDGET_MS,
+        # Preprocessing breakdown
+        preprocess_mean_ms = float(np.mean(pre)),
+        preprocess_std_ms  = float(np.std(pre)),
+        preprocess_p95_ms  = float(np.percentile(pre, 95)),
+        # Network breakdown
+        network_mean_ms    = float(np.mean(net)),
+        network_std_ms     = float(np.std(net)),
+        network_p95_ms     = float(np.percentile(net, 95)),
+        # Total end-to-end
+        total_mean_ms      = float(np.mean(tot)),
+        total_std_ms       = float(np.std(tot)),
+        total_min_ms       = float(np.min(tot)),
+        total_max_ms       = float(np.max(tot)),
+        total_p95_ms       = float(np.percentile(tot, 95)),
+        rt_ok              = float(np.percentile(tot, 95)) <= RT_BUDGET_MS,
     )
 
 
@@ -149,31 +231,35 @@ def benchmark_all(trained_models: dict, device: torch.device) -> dict:
     Parameters
     ----------
     trained_models : {arch_name -> {sid -> nn.Module}}
-                     Uses first subject's model — arch is identical across subjects.
 
     Returns
     -------
-    rt : {arch_name -> {footprint, flops, latency}}
+    rt : {arch_name -> {footprint, flops, required_gflops, latency}}
     """
     rt = {}
     for arch, models_by_sid in tqdm(trained_models.items(),
                                     desc="RT benchmark", unit="arch"):
         model = next(iter(models_by_sid.values()))
-        flops_g = count_flops(model, device)
+        flops_g = count_flops(model, device, arch=arch)
         rt[arch] = dict(
-            footprint      = model_footprint(model),
-            flops          = flops_g,
-            required_gflops= required_gflops_per_sec(flops_g),
-            latency        = benchmark_latency(model),
+            footprint       = model_footprint(model),
+            flops           = flops_g,
+            required_gflops = required_gflops_per_sec(flops_g),
+            latency         = benchmark_latency(model, arch=arch),
         )
-        log.info("[%s] params=%s  size=%.1f MB  p95=%.1f ms  rt_ok=%s",
+        lat = rt[arch]["latency"]
+        log.info("[%s] params=%s  size=%.1f MB  "
+                 "preprocess_p95=%.1f ms  network_p95=%.1f ms  "
+                 "total_p95=%.1f ms  rt_ok=%s",
                  arch,
                  f"{rt[arch]['footprint']['total_params']:,}",
                  rt[arch]['footprint']['size_mb'],
-                 rt[arch]['latency']['p95_ms'],
-                 rt[arch]['latency']['rt_ok'])
+                 lat['preprocess_p95_ms'],
+                 lat['network_p95_ms'],
+                 lat['total_p95_ms'],
+                 lat['rt_ok'])
 
-        model.to(device)   # move back after CPU benchmark
+        model.to(device)
 
     return rt
 
@@ -183,10 +269,11 @@ def benchmark_all(trained_models: dict, device: torch.device) -> dict:
 # ─────────────────────────────────────────────
 
 def print_rt_report(rt: dict) -> None:
-    print("\n" + "=" * 70)
-    print(f"{'Real-Time Feasibility Report':^70}")
-    print(f"{'Budget: acquisition 260ms + inference <= 300ms  =>  <=40ms':^70}")
-    print("=" * 70)
+    print("\n" + "=" * 75)
+    print(f"{'Real-Time Feasibility Report':^75}")
+    print(f"{'Budget: acquisition 260ms + full pipeline <= 300ms  =>  <=40ms':^75}")
+    print(f"{'Pipeline: STFT(8ch) + log1p + tensor conv + network forward':^75}")
+    print("=" * 75)
 
     for arch, data in rt.items():
         lbl   = LABELS.get(arch, arch)
@@ -196,75 +283,88 @@ def print_rt_report(rt: dict) -> None:
         req   = data["required_gflops"]
 
         print(f"\n  {lbl}")
-        print(f"    Parameters : {fp['total_params']:>12,}  "
+        print(f"    Parameters   : {fp['total_params']:>12,}  "
               f"(trainable: {fp['trainable_params']:,})")
-        print(f"    Model size : {fp['size_mb']:>9.1f} MB")
+        print(f"    Model size   : {fp['size_mb']:>9.1f} MB")
         if flops is not None:
-            print(f"    GFLOPs     : {flops:>9.4f}  (per inference)")
-            print(f"    Min GFLOP/s: {req:>9.4f}  (to meet {RT_BUDGET_MS:.0f} ms budget, "
+            print(f"    GFLOPs       : {flops:>9.4f}  (network only, per inference)")
+            print(f"    Min GFLOP/s  : {req:>9.4f}  (to meet {RT_BUDGET_MS:.0f} ms budget, "
                   f"theoretical lower bound)")
-        print(f"    Latency    :  {lat['mean_ms']:.2f} ± {lat['std_ms']:.2f} ms  "
-              f"(p95={lat['p95_ms']:.2f} ms)")
+        print(f"    Preprocessing:  {lat['preprocess_mean_ms']:.2f} "
+              f"\u00b1 {lat['preprocess_std_ms']:.2f} ms  "
+              f"(p95={lat['preprocess_p95_ms']:.2f} ms)")
+        print(f"    Network      :  {lat['network_mean_ms']:.2f} "
+              f"\u00b1 {lat['network_std_ms']:.2f} ms  "
+              f"(p95={lat['network_p95_ms']:.2f} ms)")
+        print(f"    Total        :  {lat['total_mean_ms']:.2f} "
+              f"\u00b1 {lat['total_std_ms']:.2f} ms  "
+              f"(p95={lat['total_p95_ms']:.2f} ms)")
         status = "PASS" if lat["rt_ok"] else "FAIL"
         sign   = "<=" if lat["rt_ok"] else ">"
-        print(f"    RT check   :  {status}  (p95 {sign} {RT_BUDGET_MS:.0f} ms)")
+        print(f"    RT check     :  {status}  (total p95 {sign} {RT_BUDGET_MS:.0f} ms)")
 
-    print("=" * 70)
+    print("=" * 75)
 
 
 def plot_rt_comparison(rt: dict, save_path: str = None) -> None:
-    """Three-panel: latency bars, trainable parameter count, min GFLOP/s required."""
+    """Four-panel: stacked latency, trainable params, min GFLOP/s, model size."""
     archs  = list(rt.keys())
-    colors = ["steelblue", "coral", "seagreen"]
-    x      = np.arange(len(archs))
+    labels = [LABELS.get(a, a) for a in archs]
+    colors_pre = "lightgray"
+    colors_net = ["steelblue", "coral", "royalblue", "darkblue"]
+    x = np.arange(len(archs))
 
     has_flops = any(rt[a]["required_gflops"] is not None for a in archs)
     ncols = 3 if has_flops else 2
     fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 5))
-    fig.suptitle("Real-Time Feasibility", fontsize=13, fontweight="bold")
+    fig.suptitle("Real-Time Feasibility (Full Pipeline)", fontsize=13, fontweight="bold")
 
-    # Panel 1 — latency
-    ax    = axes[0]
-    means = [rt[a]["latency"]["mean_ms"] for a in archs]
-    p95s  = [rt[a]["latency"]["p95_ms"]  for a in archs]
-    ax.bar(x, means, color=[colors[i % len(colors)] for i in range(len(archs))],
-           alpha=0.8, label="Mean")
-    ax.scatter(x, p95s, marker="D", color="black", zorder=5, label="p95")
+    # ── Panel 1: stacked latency (preprocessing + network) ──
+    ax = axes[0]
+    pre_vals = [rt[a]["latency"]["preprocess_mean_ms"] for a in archs]
+    net_vals = [rt[a]["latency"]["network_mean_ms"]    for a in archs]
+    tot_p95  = [rt[a]["latency"]["total_p95_ms"]       for a in archs]
+
+    ax.bar(x, pre_vals, color=colors_pre, alpha=0.9, label="Preprocessing (STFT)")
+    ax.bar(x, net_vals, bottom=pre_vals,
+           color=[colors_net[i % len(colors_net)] for i in range(len(archs))],
+           alpha=0.8, label="Network")
+    ax.scatter(x, tot_p95, marker="D", color="black", zorder=5, s=40, label="Total p95")
     ax.axhline(RT_BUDGET_MS, color="red", linestyle="--",
                linewidth=1.5, label=f"Budget ({RT_BUDGET_MS:.0f} ms)")
     ax.set_xticks(x)
-    ax.set_xticklabels([LABELS.get(a, a) for a in archs])
-    ax.set_ylabel("Inference time (ms)")
-    ax.set_title("CPU Latency per Window")
-    ax.legend()
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_ylabel("Latency (ms)")
+    ax.set_title("Full Pipeline Latency")
+    ax.legend(fontsize=7)
 
-    # Panel 2 — trainable params
+    # ── Panel 2: trainable params ────────────────────────────
     ax = axes[1]
     trainable = [rt[a]["footprint"]["trainable_params"] / 1e6 for a in archs]
     ax.bar(x, trainable,
-           color=[colors[i % len(colors)] for i in range(len(archs))], alpha=0.8)
+           color=[colors_net[i % len(colors_net)] for i in range(len(archs))], alpha=0.8)
     ax.set_xticks(x)
-    ax.set_xticklabels([LABELS.get(a, a) for a in archs])
+    ax.set_xticklabels(labels, fontsize=8)
     ax.set_ylabel("Trainable parameters (M)")
     ax.set_title("Model Complexity")
 
-    # Panel 3 — minimum GFLOP/s required to meet RT budget
+    # ── Panel 3: min GFLOP/s ─────────────────────────────────
     if has_flops:
         ax = axes[2]
         req_vals = [rt[a]["required_gflops"] or 0.0 for a in archs]
         bars = ax.bar(x, req_vals,
-                      color=[colors[i % len(colors)] for i in range(len(archs))],
+                      color=[colors_net[i % len(colors_net)] for i in range(len(archs))],
                       alpha=0.8)
-        # Annotate each bar with the actual value
         for bar, val in zip(bars, req_vals):
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + max(req_vals) * 0.02,
-                    f"{val:.3f}", ha="center", va="bottom", fontsize=9)
+            if val > 0:
+                ax.text(bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + max(req_vals) * 0.02,
+                        f"{val:.3f}", ha="center", va="bottom", fontsize=9)
         ax.set_xticks(x)
-        ax.set_xticklabels([LABELS.get(a, a) for a in archs])
+        ax.set_xticklabels(labels, fontsize=8)
         ax.set_ylabel("GFLOP/s")
         ax.set_title(f"Min GFLOP/s to Meet {RT_BUDGET_MS:.0f} ms Budget\n"
-                     "(theoretical lower bound)")
+                     "(network only, theoretical lower bound)")
 
     plt.tight_layout()
     if save_path:
