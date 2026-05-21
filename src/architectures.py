@@ -106,21 +106,26 @@ class AttentionPool(nn.Module):
     """
     Attention-based temporal pooling  [9, Yang et al. 2016].
 
-    Learns per-timestep importance weights to produce a single
-    summary vector from the TCN output sequence.
+    v_n   = tanh(W_a · h_n + b_a)          — hidden representation
+    a_n   = softmax(v_n^T · u_a)            — scalar importance per timestep
+    s     = sum_n(a_n · h_n)               — weighted summary vector
+
+    u_a is initialised to zeros so initial scores are uniform across
+    all timesteps, preventing the attention from collapsing onto a
+    single timestep before the network has learned anything useful.
     """
     def __init__(self, n_hidden: int):
         super().__init__()
         self.W_a = nn.Linear(n_hidden, n_hidden)
-        self.u_a = nn.Parameter(torch.randn(n_hidden))
+        self.u_a = nn.Parameter(torch.zeros(n_hidden))   # zeros → uniform init
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (N, C, T) → transpose to (N, T, C)
+        # x: (N, C, T) → (N, T, C)
         x = x.transpose(1, 2)
-        v = torch.tanh(self.W_a(x))        # (N, T, C)
-        scores = (v * self.u_a).sum(dim=2)  # (N, T)
+        v      = torch.tanh(self.W_a(x))               # (N, T, C)
+        scores = (v * self.u_a).sum(dim=2)              # (N, T)
         alpha  = torch.softmax(scores, dim=1).unsqueeze(2)  # (N, T, 1)
-        return (x * alpha).sum(dim=1)       # (N, C)
+        return (x * alpha).sum(dim=1)                   # (N, C)
 
 
 class TCN_EMG(nn.Module):
