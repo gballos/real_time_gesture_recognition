@@ -15,8 +15,10 @@ Input conventions:
 References
 ----------
 [1]  Côté-Allard et al. (2019) "Deep Learning for EMG-Based ..."
-[9]  Tsinganos et al. (2019) "Improved Gesture Recognition Based on
+[*]  Tsinganos et al. (2019) "Improved Gesture Recognition Based on
      sEMG Signals and TCN." ICASSP.
+[5]  Geng et al. (2016) "Gesture recognition by instantaneous
+     surface EMG images." Sci. Rep. 6, 36571.
 """
 
 import math
@@ -226,7 +228,7 @@ class MobileNetV2EMG(nn.Module):
 
     References
     ----------
-    [10] Geng et al. (2016) "Gesture recognition by instantaneous
+    [5] Geng et al. (2016) "Gesture recognition by instantaneous
          surface EMG images." Sci. Rep. 6, 36571.
     """
 
