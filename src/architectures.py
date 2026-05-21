@@ -213,7 +213,22 @@ class SlowFusionEMG(nn.Module):
 # ════════════════════════════════════════════════════════════════
 
 class MobileNetV2EMG(nn.Module):
-    """MobileNetV2 for 4-channel STFT spectrograms. Input: (N, 4, 8, 14)."""
+    """
+    MobileNetV2 adapted for EMG spectrograms.
+
+    Input layout: (N, 4, 8, 14) — (Batch, Time, Electrodes, Freq)
+
+    Reshaping strategy (Option 3 — EMG image layout):
+      (N, 4, 8, 14) → permute → (N, 8, 4, 14)
+                    → reshape → (N, 1, 8, 56)   [electrode rows × time-freq cols]
+                    → upsample → (N, 1, 64, 64)
+                    → expand → (N, 3, 64, 64)   [replicate for pretrained conv]
+
+    References
+    ----------
+    [10] Geng et al. (2016) "Gesture recognition by instantaneous
+         surface EMG images." Sci. Rep. 6, 36571.
+    """
 
     def __init__(self, n_classes: int = 17, dropout: float = 0.5,
                  freeze_until: int = 7):
@@ -221,20 +236,16 @@ class MobileNetV2EMG(nn.Module):
         self._upsample     = (64, 64)
         self._freeze_until = freeze_until
 
+        # Load pretrained weights — keep first conv as 3-channel
+        # (we replicate the single-channel input 3× at runtime)
         base = mobilenet_v2(weights=MobileNet_V2_Weights.IMAGENET1K_V1)
-
-        old = base.features[0][0]
-        new_conv = nn.Conv2d(4, old.out_channels, kernel_size=old.kernel_size,
-                             stride=old.stride, padding=old.padding, bias=False)
-        nn.init.kaiming_normal_(new_conv.weight, mode="fan_out", nonlinearity="relu")
-        base.features[0][0] = new_conv
 
         in_features = base.classifier[1].in_features
         base.classifier = nn.Sequential(
             nn.Dropout(dropout), nn.Linear(in_features, n_classes),
         )
 
-        self.features   = base.features
+        self.features   = base.features   # first conv stays 3-channel
         self.classifier = base.classifier
 
         for i, layer in enumerate(self.features):
@@ -258,10 +269,23 @@ class MobileNetV2EMG(nn.Module):
         ]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.interpolate(x, size=self._upsample, mode="bilinear", align_corners=False)
+        # x: (N, 4, 8, 14)
+        N = x.shape[0]
+
+        # Reshape to EMG image: electrode rows × (time-freq) cols  [10]
+        x = x.permute(0, 2, 1, 3)           # (N, 8, 4, 14)
+        x = x.reshape(N, 1, 8, 56)          # (N, 1, 8, 56)
+
+        # Upsample to 64×64
+        x = F.interpolate(x, size=self._upsample,
+                          mode="bilinear", align_corners=False)  # (N, 1, 64, 64)
+
+        # Replicate single channel 3× to match pretrained first conv weights
+        # Preserves all ImageNet initialisation — no Kaiming reinit needed
+        x = x.expand(-1, 3, -1, -1)         # (N, 3, 64, 64)
+
         x = self.features(x)
         return self.classifier(x.mean([2, 3]))
-
 
 # ════════════════════════════════════════════════════════════════
 # Factory
