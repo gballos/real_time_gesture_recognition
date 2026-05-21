@@ -107,7 +107,7 @@ def plot_comparison(results: dict, save_path: str | None = None) -> None:
 
         if metric == "acc":
             ax.axhline(PAPER_ACC, color="green", linestyle="--",
-                       linewidth=1.2, label="[1] Paper ref (~68.98%)")
+                       linewidth=1.2, label="[4] Paper ref (~68.98%)")
 
         ax.set_xticks(x)
         ax.set_xticklabels(sids)
@@ -178,4 +178,4 @@ def print_summary(results: dict) -> None:
         row += [f"{mean_acc:.3f}".rjust(14), f"{mean_f1:.3f}".rjust(10)]
     print("".join(row))
     print("=" * (10 + 24 * len(archs)))
-    print(f"\n[1] Reference: ~{PAPER_ACC:.2%} (Côté-Allard 2019, spectrogram)")
+    print(f"\n[4] Reference: ~{PAPER_ACC:.2%} (Côté-Allard 2019, spectrogram)")
